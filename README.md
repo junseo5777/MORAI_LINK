@@ -51,6 +51,7 @@ MORAI link/node map과 Dijkstra로 생성한 전역 경로를 RViz에 표시한 
 ### MORAI 시뮬레이터 연동
 
 MORAI 차량의 실제 주행 위치와 RViz에 표시되는 전역 경로를 함께 확인할 수 있습니다.
+빨간선이 Dijkstra로 계산된 Global Path이고 분홍색 선이 실제 자동차의 위치가 있는 링크를 나타냅니다.
 
 ![MORAI 시뮬레이터와 RViz 전역 경로](docs/images/morai-rviz-driving-cropped.png)
 
