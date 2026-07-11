@@ -22,7 +22,8 @@ class MoraiMapPlanner:
         node_path=None,
         use_utm_offset=True,
         heading_filter_deg=90.0,
-        lane_change_penalty=30.0
+        lane_change_penalty=30.0,
+        lane_change_lookahead_m=20.0
     ):
         self.link_path = link_path
         self.node_path = node_path
@@ -32,6 +33,7 @@ class MoraiMapPlanner:
         self.heading_filter_deg = heading_filter_deg
         self.heading_filter_rad = math.radians(float(heading_filter_deg))
         self.lane_change_penalty = lane_change_penalty
+        self.lane_change_lookahead_m = float(lane_change_lookahead_m)
 
         self.links = []
         self.nodes = []
@@ -46,7 +48,7 @@ class MoraiMapPlanner:
     @staticmethod
     def default_map_path(file_name):
         package_src = Path(__file__).resolve().parents[1]
-        return str(package_src / 'path' / 'MGeo' / file_name)
+        return str(package_src / 'path' / file_name)
 
     def load(self):
         self.load_link_set()
@@ -448,7 +450,8 @@ class MoraiMapPlanner:
             start_link.get('idx'),
             goal_link.get('idx'),
             lane_change_penalty=self.lane_change_penalty,
-            stop_line_node_idxs=self.get_stop_line_node_idxs()
+            stop_line_node_idxs=self.get_stop_line_node_idxs(),
+            lane_change_lookahead_m=self.lane_change_lookahead_m
         )
 
         if not dijkstra_result['success']:
@@ -546,16 +549,16 @@ class MoraiMapPlanner:
         next_points = next_link['points']
 
         min_change_index = min(len(current_points) - 1, current_start_index + 1)
-        preferred_index = int((len(current_points) - 1) * 0.2)
+        preferred_index = int((len(current_points) - 1) * 0.1)
         change_index = max(min_change_index, preferred_index)
         change_index = min(change_index, len(current_points) - 1)
 
         change_point = current_points[change_index]
         nearest_next_index = self.find_nearest_point_index(next_link, change_point)
-        next_forward_offset = max(1, int((len(next_points) - 1) * 0.5))
-        next_start_index = min(
-            nearest_next_index + next_forward_offset,
-            len(next_points) - 1
+        next_start_index = self.find_forward_index_by_distance(
+            next_link,
+            nearest_next_index,
+            self.lane_change_lookahead_m
         )
 
         if next_link.get('idx') == goal_link.get('idx'):
@@ -576,6 +579,23 @@ class MoraiMapPlanner:
         dx = xy[:, 0] - point['utm_x']
         dy = xy[:, 1] - point['utm_y']
         return int(np.argmin(dx * dx + dy * dy))
+
+    def find_forward_index_by_distance(self, link, start_index, forward_distance):
+        points = link['points']
+        target_index = max(0, min(int(start_index), len(points) - 1))
+        remaining_distance = max(0.0, float(forward_distance))
+
+        while target_index < len(points) - 1 and remaining_distance > 0.0:
+            p0 = points[target_index]
+            p1 = points[target_index + 1]
+            segment_length = math.hypot(
+                p1['utm_x'] - p0['utm_x'],
+                p1['utm_y'] - p0['utm_y']
+            )
+            remaining_distance -= segment_length
+            target_index += 1
+
+        return target_index
 
     def make_lane_change_curve(self, current_link, current_index, next_link, next_index):
         p0 = current_link['points'][current_index]

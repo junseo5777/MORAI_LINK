@@ -11,6 +11,7 @@ import rospy
 from geometry_msgs.msg import Point
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
+from macaron_8.msg import CurrentLink
 
 class MoraiGlobalPathVisualizer:
     def __init__(self):
@@ -21,15 +22,18 @@ class MoraiGlobalPathVisualizer:
         self.ego_marker_default_z = 1.0   # z 추정 실패 시 기본 높이
         self.ego_marker_z_offset = 0.0    # ego 마커 z 보정값
         self.ego_z_grid_cell_size = 10.0  # z 탐색 그리드 크기(m)
+        self.current_link_marker_z_offset = 0.25
 
         self.current_pose_topic = '/current_pose'
         self.map_data_topic = '/morai_map_data'
         self.route_data_topic = '/morai_route_data'
+        self.current_link_topic = '/current_link_data'
 
         self.route_marker_topic = '/global_path_marker'
         self.map_marker_topic = '/morai_link_markers'
         self.dijkstra_marker_topic = '/dijkstra_route_markers'
         self.ego_marker_topic = '/ego_vehicle_marker'
+        self.current_link_marker_topic = '/current_link_marker'
 
         self.route_marker_pub = rospy.Publisher(
             self.route_marker_topic,
@@ -54,7 +58,14 @@ class MoraiGlobalPathVisualizer:
             Marker,
             queue_size=10
         )
+        self.current_link_marker_pub = rospy.Publisher(
+            self.current_link_marker_topic,
+            Marker,
+            queue_size=10
+        )
 
+        self.link_by_idx = {}
+        self.last_current_link_idx = None
         self.ego_segment_start_xy = np.empty((0, 2), dtype=np.float64)
         self.ego_segment_vec_xy = np.empty((0, 2), dtype=np.float64)
         self.ego_segment_len_sq = np.empty((0,), dtype=np.float64)
@@ -81,6 +92,12 @@ class MoraiGlobalPathVisualizer:
             self.current_pose_callback,
             queue_size=10
         )
+        self.current_link_sub = rospy.Subscriber(
+            self.current_link_topic,
+            CurrentLink,
+            self.current_link_callback,
+            queue_size=10
+        )
 
         rospy.loginfo(
             'Waiting for map data from %s and route data from %s',
@@ -103,11 +120,19 @@ class MoraiGlobalPathVisualizer:
         links = payload.get('links', [])
         nodes = payload.get('nodes', [])
 
+        self.link_by_idx = {
+            str(link.get('idx')): link
+            for link in links
+            if link.get('idx') is not None
+        }
         self.build_ego_z_lookup(links)
         self.publish_map_markers(
             links,
             nodes
         )
+
+        if self.last_current_link_idx is not None:
+            self.publish_current_link_marker(self.last_current_link_idx)
 
     def route_data_callback(self, msg):
         payload = self.loads(msg.data, 'route data')
@@ -120,6 +145,11 @@ class MoraiGlobalPathVisualizer:
             payload.get('start_point'),
             payload.get('goal_point')
         )
+
+    def current_link_callback(self, msg):
+        link_idx = str(msg.link_idx)
+        self.last_current_link_idx = link_idx
+        self.publish_current_link_marker(link_idx)
 
     def loads(self, data, data_name):
         try:
@@ -411,6 +441,62 @@ class MoraiGlobalPathVisualizer:
             'Published RViz Dijkstra markers: route_links=%d',
             len(route_links)
         )
+
+    def publish_current_link_marker(self, link_idx):
+        if not link_idx:
+            self.clear_current_link_marker()
+            return
+
+        if not self.link_by_idx:
+            return
+
+        link = self.link_by_idx.get(str(link_idx))
+
+        if link is None:
+            self.clear_current_link_marker()
+            rospy.logwarn_throttle(
+                2.0,
+                'Current link %s not found in MORAI map data',
+                link_idx
+            )
+            return
+
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = 'current_link'
+        marker.id = 0
+
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+
+        marker.scale.x = 0.9
+
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 1.0
+        marker.color.a = 1.0
+
+        for p in link.get('points', []):
+            marker.points.append(
+                self.make_point(
+                    p.get('rviz_x', 0.0),
+                    p.get('rviz_y', 0.0),
+                    p.get('z', 0.0) + self.current_link_marker_z_offset
+                )
+            )
+
+        self.current_link_marker_pub.publish(marker)
+
+    def clear_current_link_marker(self):
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = 'current_link'
+        marker.id = 0
+        marker.action = Marker.DELETE
+        self.current_link_marker_pub.publish(marker)
 
     def publish_ego_vehicle_marker(self, utm_x, utm_y, yaw):
         marker = Marker()

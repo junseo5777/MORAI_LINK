@@ -9,7 +9,7 @@ from tf.transformations import euler_from_quaternion
 
 from pyproj import Transformer
 
-network_module_path = Path(__file__).resolve().parents[3] / 'MORAI-NetworkModule'
+network_module_path = Path(__file__).resolve().parents[3] / 'NetworkModule'
 sys.path.append(str(network_module_path))
 
 from lib.network.UDP import Receiver
@@ -20,10 +20,10 @@ from lib.define.IMU import IMU
 # UDP 통신 정리 ============
 # GPS_Data
 GPS_IP = '127.0.0.1'
-GPS_PORT = 1111    # Destination PORT로 받아야 함
+GPS_PORT = 9090    # Destination PORT로 받아야 함
 # IMU_Data
 IMU_IP = '127.0.0.1'
-IMU_PORT = 1112    # Destination PORT로 받아야 함
+IMU_PORT = 9088    # Destination PORT로 받아야 함
 #========================
 
 transformer = Transformer.from_crs("EPSG:4326", "EPSG:32652", always_xy=True)
@@ -64,7 +64,7 @@ class SensorDataHub:
 
         lat = gps_data.gpgga.lat
         lon = gps_data.gpgga.lon
-
+        
         if lat == 0.0 or lon == 0.0:
             lat = gps_data.gprmc.lat
             lon = gps_data.gprmc.lon

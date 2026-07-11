@@ -1,5 +1,3 @@
-# dijkstra_path.py
-
 import heapq
 
 import numpy as np
@@ -44,6 +42,77 @@ def calc_link_length_from_points(link):
     return float(np.linalg.norm(segment_xy, axis=1).sum())
 
 
+def link_points_to_xy(link):
+    points = link.get('points', [])
+
+    if len(points) < 2:
+        return None
+
+    try:
+        if isinstance(points[0], dict):
+            xy = np.asarray(
+                [
+                    (
+                        p.get('utm_x', p.get('morai_x')),
+                        p.get('utm_y', p.get('morai_y'))
+                    )
+                    for p in points
+                ],
+                dtype=np.float64
+            )
+        else:
+            xy = np.asarray(points, dtype=np.float64)[:, :2]
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    if xy.shape[0] < 2 or not np.all(np.isfinite(xy)):
+        return None
+
+    return xy
+
+
+def distance_from_index_to_end(xy, start_index):
+    start_index = max(0, min(int(start_index), xy.shape[0] - 1))
+
+    if start_index >= xy.shape[0] - 1:
+        return 0.0
+
+    segment_xy = np.diff(xy[start_index:], axis=0)
+    return float(np.linalg.norm(segment_xy, axis=1).sum())
+
+
+def find_nearest_xy_index(xy, point_xy):
+    diff_xy = xy - point_xy
+    dist_sq = diff_xy[:, 0] * diff_xy[:, 0] + diff_xy[:, 1] * diff_xy[:, 1]
+    return int(np.argmin(dist_sq))
+
+
+def has_lane_change_distance(link, dst_link, lane_change_lookahead_m):
+    if lane_change_lookahead_m is None or lane_change_lookahead_m <= 0.0:
+        return True
+
+    current_xy = link_points_to_xy(link)
+    dst_xy = link_points_to_xy(dst_link)
+
+    if current_xy is None or dst_xy is None:
+        return False
+
+    min_change_index = min(current_xy.shape[0] - 1, 1)
+    preferred_index = int((current_xy.shape[0] - 1) * 0.1)
+    change_index = max(min_change_index, preferred_index)
+    change_index = min(change_index, current_xy.shape[0] - 1)
+
+    if distance_from_index_to_end(current_xy, change_index) < lane_change_lookahead_m:
+        return False
+
+    nearest_dst_index = find_nearest_xy_index(dst_xy, current_xy[change_index])
+
+    return (
+        distance_from_index_to_end(dst_xy, nearest_dst_index)
+        >= lane_change_lookahead_m
+    )
+
+
 def get_link_cost(link):
     """
     Dijkstra에서 사용할 link 비용 계산.
@@ -60,7 +129,12 @@ def get_link_cost(link):
 
 
 
-def build_link_graph(links, lane_change_penalty=30.0, stop_line_node_idxs=None):
+def build_link_graph(
+    links,
+    lane_change_penalty=30.0,
+    stop_line_node_idxs=None,
+    lane_change_lookahead_m=20.0
+):
     """
     links 리스트를 link 기반 방향 그래프로 변환.
 
@@ -127,7 +201,8 @@ def build_link_graph(links, lane_change_penalty=30.0, stop_line_node_idxs=None):
             link,
             'left',
             lane_change_penalty,
-            stop_line_node_idxs
+            stop_line_node_idxs,
+            lane_change_lookahead_m
         )
         add_lane_change_edge(
             graph,
@@ -135,7 +210,8 @@ def build_link_graph(links, lane_change_penalty=30.0, stop_line_node_idxs=None):
             link,
             'right',
             lane_change_penalty,
-            stop_line_node_idxs
+            stop_line_node_idxs,
+            lane_change_lookahead_m
         )
 
     return graph, link_by_idx
@@ -147,7 +223,8 @@ def add_lane_change_edge(
     link,
     side,
     lane_change_penalty,
-    stop_line_node_idxs
+    stop_line_node_idxs,
+    lane_change_lookahead_m
 ):
     link_idx = link.get('idx')
     from_node = link.get('from_node_idx')
@@ -176,6 +253,9 @@ def add_lane_change_edge(
     if dst_cost == float('inf'):
         return
 
+    if not has_lane_change_distance(link, dst_link, lane_change_lookahead_m):
+        return
+
     graph[link_idx].append({
         'to_link': dst_link_idx,
         'from_link': link,
@@ -192,7 +272,8 @@ def dijkstra_link(
     start_link_idx,
     goal_link_idx,
     lane_change_penalty=30.0,
-    stop_line_node_idxs=None
+    stop_line_node_idxs=None,
+    lane_change_lookahead_m=20.0
 ):
     """
     일반 진행 edge:
@@ -205,7 +286,8 @@ def dijkstra_link(
     graph, link_by_idx = build_link_graph(
         links,
         lane_change_penalty=lane_change_penalty,
-        stop_line_node_idxs=stop_line_node_idxs
+        stop_line_node_idxs=stop_line_node_idxs,
+        lane_change_lookahead_m=lane_change_lookahead_m
     )
 
     if start_link_idx not in link_by_idx or goal_link_idx not in link_by_idx:
