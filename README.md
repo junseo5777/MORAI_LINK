@@ -40,6 +40,26 @@ MORAI 자율주행 시뮬레이션 환경에서 제공되는 link/node 데이터
 - 현재 link 추정 시 다익스트라 경로의 현재·다음 route link뿐만 아니라, 각 route link에서 실제 차선 변경이 가능한 좌우 link까지 후보에 포함
 - 현재 link의 제한속도, 신호 정보와 좌우 차선 변경 가능 여부 publish
 
+## 실행 화면
+
+### RViz 전역 경로 시각화
+
+MORAI link/node map과 Dijkstra로 생성한 전역 경로를 RViz에 표시한 화면입니다.
+
+![RViz 전역 경로 시각화](docs/images/rviz-global-path-cropped.png)
+
+### MORAI 시뮬레이터 연동
+
+MORAI 차량의 실제 주행 위치와 RViz에 표시되는 전역 경로를 함께 확인할 수 있습니다.
+
+![MORAI 시뮬레이터와 RViz 전역 경로](docs/images/morai-rviz-driving-cropped.png)
+
+### 회전교차로 경로
+
+회전교차로 구간에서 link 기반으로 생성된 경로와 차량 위치를 비교한 화면입니다.
+
+![회전교차로의 MORAI 시뮬레이터와 RViz 경로](docs/images/morai-rviz-roundabout-cropped.png)
+
 ## 주요 ROS topic
 
 | Topic | Type | Description |
