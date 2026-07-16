@@ -1,14 +1,10 @@
+# dijkstra_path.py
 import heapq
 
 import numpy as np
 
 
 def calc_link_length_from_points(link):
-    """
-    link_length가 없을 때 points로 길이를 직접 계산하는 함수.
-    points가 dict 형식이어도 되고, [x, y, z] 리스트 형식이어도 됨.
-    """
-
     points = link.get('points', [])
 
     if len(points) < 2:
@@ -132,7 +128,6 @@ def get_link_cost(link):
 def build_link_graph(
     links,
     lane_change_penalty=30.0,
-    stop_line_node_idxs=None,
     lane_change_lookahead_m=20.0
 ):
     """
@@ -149,8 +144,6 @@ def build_link_graph(
         ...
     ]
     """
-
-    stop_line_node_idxs = set(stop_line_node_idxs or [])
 
     graph = {}
     link_by_idx = {}
@@ -201,7 +194,6 @@ def build_link_graph(
             link,
             'left',
             lane_change_penalty,
-            stop_line_node_idxs,
             lane_change_lookahead_m
         )
         add_lane_change_edge(
@@ -210,7 +202,6 @@ def build_link_graph(
             link,
             'right',
             lane_change_penalty,
-            stop_line_node_idxs,
             lane_change_lookahead_m
         )
 
@@ -223,14 +214,9 @@ def add_lane_change_edge(
     link,
     side,
     lane_change_penalty,
-    stop_line_node_idxs,
     lane_change_lookahead_m
 ):
     link_idx = link.get('idx')
-    from_node = link.get('from_node_idx')
-
-    if from_node in stop_line_node_idxs:
-        return
 
     if side == 'left':
         can_change = link.get('can_move_left_lane')
@@ -272,7 +258,6 @@ def dijkstra_link(
     start_link_idx,
     goal_link_idx,
     lane_change_penalty=30.0,
-    stop_line_node_idxs=None,
     lane_change_lookahead_m=20.0
 ):
     """
@@ -286,7 +271,6 @@ def dijkstra_link(
     graph, link_by_idx = build_link_graph(
         links,
         lane_change_penalty=lane_change_penalty,
-        stop_line_node_idxs=stop_line_node_idxs,
         lane_change_lookahead_m=lane_change_lookahead_m
     )
 

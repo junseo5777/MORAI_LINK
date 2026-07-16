@@ -431,6 +431,113 @@ class MoraiMapPlanner:
             'dijkstra_result': dijkstra_result
         }
 
+    def plan_fixed_link_route(self, checkpoint_link_idxs):
+        if len(checkpoint_link_idxs) < 2:
+            return self.make_failed_path_result('fixed_route_too_short')
+
+        link_by_idx = {
+            link.get('idx'): link
+            for link in self.links
+            if link.get('idx') is not None
+        }
+
+        for link_idx in checkpoint_link_idxs:
+            if link_idx not in link_by_idx:
+                return self.make_failed_path_result(
+                    'fixed_route_link_not_found:%s' % link_idx
+                )
+
+        if checkpoint_link_idxs[0] != checkpoint_link_idxs[-1]:
+            return self.make_failed_path_result('fixed_route_not_closed')
+
+        route_link_idxs = []
+        route_links = []
+        edge_path = []
+        total_cost = 0.0
+
+        for start_link_idx, goal_link_idx in zip(
+            checkpoint_link_idxs,
+            checkpoint_link_idxs[1:]
+        ):
+            segment_result = dijkstra_link(
+                self.links,
+                start_link_idx,
+                goal_link_idx,
+                lane_change_penalty=self.lane_change_penalty,
+                lane_change_lookahead_m=self.lane_change_lookahead_m
+            )
+
+            if not segment_result['success']:
+                return self.make_failed_path_result(
+                    'fixed_route_dijkstra_failed:%s->%s'
+                    % (start_link_idx, goal_link_idx),
+                    dijkstra_result=segment_result
+                )
+
+            if route_links:
+                route_link_idxs.extend(segment_result['link_idx_path'][1:])
+                route_links.extend(segment_result['link_path'][1:])
+            else:
+                route_link_idxs.extend(segment_result['link_idx_path'])
+                route_links.extend(segment_result['link_path'])
+
+            edge_path.extend(segment_result.get('edge_path', []))
+            total_cost += segment_result['total_cost']
+
+        start_link = link_by_idx[checkpoint_link_idxs[0]]
+        start_info = self.make_link_start_info(start_link)
+        goal_info = self.make_link_start_info(start_link)
+
+        dijkstra_result = {
+            'success': True,
+            'total_cost': total_cost,
+            'node_path': [],
+            'link_idx_path': route_link_idxs,
+            'link_path': route_links,
+            'edge_path': edge_path
+        }
+
+        route_points = self.make_link_route_points(
+            start_info,
+            route_links,
+            goal_info,
+            edge_path
+        )
+        path_array = self.points_to_numpy(route_points)
+
+        return {
+            'success': len(path_array) > 0,
+            'reason': None if len(path_array) > 0 else 'fixed_route_empty',
+            'path_array': path_array,
+            'route_links': route_links,
+            'start_info': start_info,
+            'goal_info': goal_info,
+            'dijkstra_result': dijkstra_result
+        }
+
+    def make_link_start_info(self, link):
+        return {
+            'link': link,
+            'point': dict(link['points'][0]),
+            'segment_index': 0,
+            'segment_ratio': 0.0,
+            'progress': 0.0,
+            'distance': 0.0,
+            'heading_error': None,
+            'used_heading_filter': False
+        }
+
+    def make_failed_path_result(self, reason, dijkstra_result=None):
+        return {
+            'success': False,
+            'reason': reason,
+            'path_array': None,
+            'route_links': [],
+            'start_info': None,
+            'goal_info': None,
+            'dijkstra_result': dijkstra_result
+        }
+
     def make_global_path(self, start_info, goal_info):
         start_link = start_info['link']
         goal_link = goal_info['link']
@@ -450,7 +557,6 @@ class MoraiMapPlanner:
             start_link.get('idx'),
             goal_link.get('idx'),
             lane_change_penalty=self.lane_change_penalty,
-            stop_line_node_idxs=self.get_stop_line_node_idxs(),
             lane_change_lookahead_m=self.lane_change_lookahead_m
         )
 

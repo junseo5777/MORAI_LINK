@@ -14,26 +14,37 @@ from std_msgs.msg import String
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from morai_link_planner import MoraiMapPlanner
-from dijkstra import has_lane_change_distance
+from lane_change_candidate import LaneChangeCandidateGenerator
 from macaron_8.msg import CurrentLink
-
-
-GOAL_UTM_X = 302592.98273088294
-GOAL_UTM_Y = 4124264.524556471
-
-# GOAL_UTM_X = 302395.77395635366
-# GOAL_UTM_Y = 4124489.0898724506
 
 
 MAP_CREATE = False
 LANE_CHANGE_LOOKAHEAD_M = 20.0
 CURRENT_LINK_LOOKAHEAD_ROUTE_COUNT = 1
+LANE_CHANGE_CANDIDATE_START_AHEAD_M = 10.0
+LANE_CHANGE_CANDIDATE_UPDATE_DISTANCE_M = 1.0
+
+FIXED_ROUTE_LINK_IDXS = [
+    'A2256W000748',
+    'A2256W000329',
+    'A2256W000219',
+    'A2256W000202',
+    'A2256W000308',
+    'A2256W000304',
+    'A2256W000146',
+    'A2256W000846',
+    'A2256W000153',
+    'A2256W000128',
+    'A2256W000332',
+    'A2256W000748'
+]
 
 ROUTE_NPY_PATH = str(
     Path(__file__).resolve().parents[1]
     / 'path'
     / 'donggul.npy'
 )
+
 
 class MoraiMapPublisher:
     def __init__(self):
@@ -48,13 +59,10 @@ class MoraiMapPublisher:
         self.map_data_topic = '/morai_map_data'
         self.route_data_topic = '/morai_route_data'
         self.current_link_topic = '/current_link_data'
+        self.lane_change_candidate_data_topic = '/lane_change_candidate_data'
         self.map_create = MAP_CREATE
         self.route_npy_path = ROUTE_NPY_PATH
 
-        self.goal_utm_x = GOAL_UTM_X
-        self.goal_utm_y = GOAL_UTM_Y
-
-        self.use_start_yaw_filter = True  #True면 시작 yaw를 고려하여 현재 차의 방향과 너무 반대인 링크는 시작후보에서 제외
         self.heading_filter_deg = 90.0  #시작 링크를 찾을 때 허용할 오차
         self.lane_change_penalty = 20.0  #차선 변경에 추가되는 패널티
         self.lane_change_lookahead_m = LANE_CHANGE_LOOKAHEAD_M  #차선 변경 목표점을 몇 m 앞에 둘지
@@ -76,6 +84,12 @@ class MoraiMapPublisher:
             self.current_link_topic,
             CurrentLink,
             queue_size=10
+        )
+        self.lane_change_candidate_data_pub = rospy.Publisher(
+            self.lane_change_candidate_data_topic,
+            String,
+            queue_size=1,
+            latch=True
         )
 
         """
@@ -99,21 +113,18 @@ class MoraiMapPublisher:
         traffic_light_id: "C1256W000066"
         related_signal: ''
         """
-        
-        
+
+
         self.planner = None
         self.route_links = []
         self.link_by_idx = {}
-        self.stop_line_node_idxs = set()
+        self.lane_change_candidate_generator = None
+        self.last_lane_change_candidate_link_idx = None
+        self.last_lane_change_candidate_progress_m = None
+        self.last_lane_change_candidate_result = None
         self.current_pose_sub = None
 
         self.load_morai_map()
-
-        if not self.has_goal():
-            rospy.logwarn(
-                'goal_utm_x, goal_utm_y 없음. GOAL_UTM_X/Y 입력하라우'
-            )
-            return
 
         start_pose = self.wait_for_first_current_pose()
         if start_pose is None:
@@ -126,9 +137,6 @@ class MoraiMapPublisher:
                 self.current_pose_callback,
                 queue_size=1
             )
-
-    def has_goal(self):
-        return self.goal_utm_x is not None and self.goal_utm_y is not None
 
     def load_morai_map(self):
         self.planner = MoraiMapPlanner(
@@ -150,7 +158,11 @@ class MoraiMapPublisher:
             for link in self.planner.links
             if link.get('idx') is not None
         }
-        self.stop_line_node_idxs = self.planner.get_stop_line_node_idxs()
+        self.lane_change_candidate_generator = LaneChangeCandidateGenerator(
+            links=self.planner.links,
+            nodes=self.planner.nodes,
+            start_ahead_of_vehicle_m=LANE_CHANGE_CANDIDATE_START_AHEAD_M
+        )
         self.publish_map_data()
         rospy.loginfo('Loaded MORAI map links: %d', len(self.planner.links))
         rospy.loginfo('Loaded MORAI map nodes: %d', len(self.planner.nodes))
@@ -202,15 +214,7 @@ class MoraiMapPublisher:
         return start_pose
 
     def plan_and_publish_route_data(self, start_pose):
-        start_yaw = start_pose['yaw'] if self.use_start_yaw_filter else None
-
-        result = self.planner.plan_path(
-            start_pose['utm_x'],
-            start_pose['utm_y'],
-            self.goal_utm_x,
-            self.goal_utm_y,
-            start_yaw=start_yaw
-        )
+        result = self.planner.plan_fixed_link_route(FIXED_ROUTE_LINK_IDXS)
 
         if not result['success']:
             rospy.logerr('Failed to make global path: %s', result['reason'])
@@ -218,6 +222,10 @@ class MoraiMapPublisher:
 
         self.log_path_result(result)
         self.route_links = result['route_links']
+        self.lane_change_candidate_generator.update_route(self.route_links)
+        self.last_lane_change_candidate_link_idx = None
+        self.last_lane_change_candidate_progress_m = None
+        self.last_lane_change_candidate_result = None
 
         if self.map_create:
             self.save_route_npy(result['path_array'])
@@ -297,11 +305,24 @@ class MoraiMapPublisher:
             on_stop_line = node.get('on_stop_line')
             traffic_light_id = node.get('traffic_light_id')
 
-        can_change_left = self.can_change_lane(link, 'left')
-        can_change_right = self.can_change_lane(link, 'right')
+        candidate_result = self.publish_lane_change_candidate_data(
+            link_idx,
+            nearest['point']['rviz_x'],
+            nearest['point']['rviz_y']
+        )
+        candidates = candidate_result.get('candidates', [])
+        can_change_left = any(
+            candidate.get('side') == 'left'
+            for candidate in candidates
+        )
+        can_change_right = any(
+            candidate.get('side') == 'right'
+            for candidate in candidates
+        )
 
         self.publish_current_link(
             link_idx,
+            link.get('link_type'),
             link.get('max_speed'),
             on_stop_line,
             traffic_light_id,
@@ -309,6 +330,57 @@ class MoraiMapPublisher:
             can_change_left,
             can_change_right
         )
+
+    def publish_lane_change_candidate_data(
+        self,
+        current_link_idx,
+        current_rviz_x,
+        current_rviz_y
+    ):
+        link_idx = '' if current_link_idx is None else str(current_link_idx)
+
+        if self.lane_change_candidate_generator is None:
+            return {
+                'current_link_idx': link_idx,
+                'next_link_idx': None,
+                'candidates': []
+            }
+
+        current_link = self.lane_change_candidate_generator.link_by_idx.get(
+            link_idx
+        )
+        current_progress = None
+
+        if current_link is not None:
+            current_progress = (
+                self.lane_change_candidate_generator.find_nearest_link_progress(
+                    current_link,
+                    float(current_rviz_x),
+                    float(current_rviz_y)
+                )
+            )
+
+        if (
+            link_idx == self.last_lane_change_candidate_link_idx
+            and current_progress is not None
+            and self.last_lane_change_candidate_progress_m is not None
+            and self.last_lane_change_candidate_result is not None
+            and abs(
+                current_progress - self.last_lane_change_candidate_progress_m
+            ) < LANE_CHANGE_CANDIDATE_UPDATE_DISTANCE_M
+        ):
+            return self.last_lane_change_candidate_result
+
+        result = self.lane_change_candidate_generator.make_candidates(
+            link_idx,
+            float(current_rviz_x),
+            float(current_rviz_y)
+        )
+        self.lane_change_candidate_data_pub.publish(self.dumps(result))
+        self.last_lane_change_candidate_link_idx = link_idx
+        self.last_lane_change_candidate_progress_m = current_progress
+        self.last_lane_change_candidate_result = result
+        return result
 
     def make_current_link_candidates(self, nearest_route_link):
         route_index = self.find_route_link_index(nearest_route_link)
@@ -374,9 +446,6 @@ class MoraiMapPublisher:
         return self.link_by_idx.get(dst_link_idx)
 
     def can_change_lane(self, link, side):
-        if link.get('from_node_idx') in self.stop_line_node_idxs:
-            return False
-
         if side == 'left':
             can_change = link.get('can_move_left_lane')
             dst_link_idx = link.get('left_lane_change_dst_link_idx')
@@ -387,20 +456,12 @@ class MoraiMapPublisher:
         if not can_change or not dst_link_idx:
             return False
 
-        dst_link = self.link_by_idx.get(dst_link_idx)
-
-        if dst_link is None:
-            return False
-
-        return has_lane_change_distance(
-            link,
-            dst_link,
-            self.lane_change_lookahead_m
-        )
+        return dst_link_idx in self.link_by_idx
 
     def publish_current_link(
         self,
         link_idx,
+        link_type,
         max_speed,
         on_stop_line,
         traffic_light_id,
@@ -410,6 +471,7 @@ class MoraiMapPublisher:
     ):
         msg = CurrentLink()
         msg.link_idx = '' if link_idx is None else str(link_idx)
+        msg.link_type = '' if link_type is None else str(link_type)
         msg.max_speed = self.to_float_or_default(max_speed, 0.0)
         msg.on_stop_line = bool(on_stop_line)
         msg.traffic_light_id = '' if traffic_light_id is None else str(traffic_light_id)

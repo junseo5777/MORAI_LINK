@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import json
 import math
 import threading
@@ -23,17 +22,20 @@ class MoraiGlobalPathVisualizer:
         self.ego_marker_z_offset = 0.0    # ego 마커 z 보정값
         self.ego_z_grid_cell_size = 10.0  # z 탐색 그리드 크기(m)
         self.current_link_marker_z_offset = 0.25
+        self.lane_change_candidate_marker_z_offset = 0.45
 
         self.current_pose_topic = '/current_pose'
         self.map_data_topic = '/morai_map_data'
         self.route_data_topic = '/morai_route_data'
         self.current_link_topic = '/current_link_data'
+        self.lane_change_candidate_data_topic = '/lane_change_candidate_data'
 
         self.route_marker_topic = '/global_path_marker'
         self.map_marker_topic = '/morai_link_markers'
         self.dijkstra_marker_topic = '/dijkstra_route_markers'
         self.ego_marker_topic = '/ego_vehicle_marker'
         self.current_link_marker_topic = '/current_link_marker'
+        self.lane_change_candidate_marker_topic = '/lane_change_candidate_markers'
 
         self.route_marker_pub = rospy.Publisher(
             self.route_marker_topic,
@@ -61,6 +63,11 @@ class MoraiGlobalPathVisualizer:
         self.current_link_marker_pub = rospy.Publisher(
             self.current_link_marker_topic,
             Marker,
+            queue_size=10
+        )
+        self.lane_change_candidate_marker_pub = rospy.Publisher(
+            self.lane_change_candidate_marker_topic,
+            MarkerArray,
             queue_size=10
         )
 
@@ -97,6 +104,12 @@ class MoraiGlobalPathVisualizer:
             CurrentLink,
             self.current_link_callback,
             queue_size=10
+        )
+        self.lane_change_candidate_data_sub = rospy.Subscriber(
+            self.lane_change_candidate_data_topic,
+            String,
+            self.lane_change_candidate_data_callback,
+            queue_size=1
         )
 
         rospy.loginfo(
@@ -150,6 +163,15 @@ class MoraiGlobalPathVisualizer:
         link_idx = str(msg.link_idx)
         self.last_current_link_idx = link_idx
         self.publish_current_link_marker(link_idx)
+
+    def lane_change_candidate_data_callback(self, msg):
+        payload = self.loads(msg.data, 'lane-change candidate data')
+        if payload is None:
+            return
+
+        self.publish_lane_change_candidate_markers(
+            payload.get('candidates', [])
+        )
 
     def loads(self, data, data_name):
         try:
@@ -497,6 +519,90 @@ class MoraiGlobalPathVisualizer:
         marker.id = 0
         marker.action = Marker.DELETE
         self.current_link_marker_pub.publish(marker)
+
+    def publish_lane_change_candidate_markers(self, candidates):
+        marker_array = MarkerArray()
+        stamp = rospy.Time.now()
+
+        for marker_id, side in enumerate(('left', 'right')):
+            marker_array.markers.append(
+                self.make_lane_change_candidate_delete_marker(
+                    marker_id,
+                    stamp
+                )
+            )
+            candidate = next(
+                (
+                    item for item in candidates
+                    if item.get('side') == side
+                ),
+                None
+            )
+
+            if candidate is None:
+                continue
+
+            path = candidate.get('path', [])
+
+            if not path:
+                continue
+
+            marker_array.markers.append(
+                self.make_lane_change_candidate_marker(
+                    marker_id,
+                    side,
+                    path,
+                    stamp
+                )
+            )
+
+        self.lane_change_candidate_marker_pub.publish(marker_array)
+
+    def make_lane_change_candidate_delete_marker(self, marker_id, stamp):
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = stamp
+        marker.ns = 'lane_change_candidates'
+        marker.id = marker_id
+        marker.action = Marker.DELETE
+        return marker
+
+    def make_lane_change_candidate_marker(
+        self,
+        marker_id,
+        side,
+        curve,
+        stamp
+    ):
+        marker = Marker()
+        marker.header.frame_id = self.frame_id
+        marker.header.stamp = stamp
+        marker.ns = 'lane_change_candidates'
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.65
+
+        if side == 'left':
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 1.0
+        else:
+            marker.color.r = 1.0
+            marker.color.g = 0.65
+            marker.color.b = 0.0
+
+        marker.color.a = 1.0
+
+        for point in curve:
+            marker.points.append(self.make_point(
+                point['rviz_x'],
+                point['rviz_y'],
+                point['z'] + self.lane_change_candidate_marker_z_offset
+            ))
+
+        return marker
 
     def publish_ego_vehicle_marker(self, utm_x, utm_y, yaw):
         marker = Marker()
