@@ -1,6 +1,6 @@
 # morai_link_global_path
 
-MORAI MGeo의 link/node 데이터를 기반으로 지정한 link 체크포인트를 Dijkstra 알고리즘으로 연결해 폐곡선 전역 경로를 생성하고, GPS/IMU 기반 현재 위치에서 current link와 차선 변경 후보 경로를 계산해 ROS 및 RViz로 시각화한 프로젝트입니다.
+MORAI MGeo의 link/node 데이터를 기반으로 지정한 link 체크포인트를 Dijkstra 알고리즘으로 연결해 폐곡선 전역 경로를 생성하고, GPS/IMU 기반 현재 위치에서 current link와 차선 변경 후보 경로를 계산해 ROS 및 RViz로 시각화를 진행했습니다.
 
 ## 구성
 
@@ -122,8 +122,7 @@ MORAI 차량의 실제 주행 위치와 RViz에 표시되는 전역 경로를 �
 
 - 초록색: MGeo map link
 - 빨간색: 생성된 global path
-- 파란색: Dijkstra route link
-- 자홍색: current link
+- 븐홍색: current link
 - 청록색: 좌측 차선 변경 후보
 - 주황색: 우측 차선 변경 후보
 - 노란색 화살표: ego vehicle 위치와 yaw
