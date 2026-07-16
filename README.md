@@ -122,7 +122,7 @@ MORAI 차량의 실제 주행 위치와 RViz에 표시되는 전역 경로를 �
 
 - 초록색: MGeo map link
 - 빨간색: 생성된 global path
-- 븐홍색: current link
+- 분홍색: current link
 - 청록색: 좌측 차선 변경 후보
 - 주황색: 우측 차선 변경 후보
 - 노란색 화살표: ego vehicle 위치와 yaw
