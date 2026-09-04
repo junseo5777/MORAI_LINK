@@ -1,243 +1,373 @@
 # morai_link
 
-MORAI MGeo의 link/node 데이터를 기반으로 지정한 link 체크포인트를 Dijkstra 알고리즘으로 연결해 폐곡선 전역 경로를 생성하고, GPS/IMU 기반 현재 위치에서 current link와 차선 변경 후보 경로를 계산해 ROS 및 RViz로 시각화를 진행했습니다.
+`morai_link`는 MORAI MGeo 도로망과 차량 위치를 결합해, MACARON 8 자율주행 시스템이 사용할 수 있는 **현재 도로 상태와 주행 후보 경로**를 만드는 모듈입니다.
 
-## 구성
+MGeo에는 도로 중심선, 링크 연결 관계, 제한속도, 차선변경 가능 여부, 정지선과 신호등 정보가 들어 있습니다. 이 모듈은 그 정보를 실시간 차량 위치에 맞춰 해석하여 다음과 같은 결과를 생성합니다.
 
-```text
-.
-├── docs/
-│   └── images/
-├── path/
-│   ├── link_set.json
-│   └── node_set.json
-├── path_planning/
-│   ├── dijkstra.py
-│   ├── lane_change_candidate.py
-│   ├── morai_link.py
-│   ├── morai_link_planner.py
-│   └── visualization.py
-└── sensor/
-    └── data_hub.py
+- 현재 차량이 위치한 링크와 도로 속성
+- 현재 차로를 유지하는 경로
+- 왼쪽·오른쪽 차선변경 후보 경로
+- 차선변경 후 따라갈 목적 링크
+- 차량 뒤쪽의 경로 기준점
+- 중앙선이 필요한 구간의 가상 차선 경계
+- 동적 장애물이 속한 링크와 링크 중심선 기준 위치
+
+## 전체 동작 흐름
+
+```mermaid
+flowchart LR
+    subgraph Input[입력]
+        Map[(MGeo<br/>link · node)]
+        Pose[/current_pose<br/>UTM x · y · yaw]
+        Objects[YOLO-LiDAR<br/>동적 객체]
+    end
+
+    subgraph Core[morai_link]
+        Planner[MoraiMapPlanner<br/>좌표 변환 · 그래프 · 최근접 검색]
+        Publisher[MoraiMapPublisher<br/>현재 위치 기반 데이터 생성]
+        Map --> Planner --> Publisher
+        Pose --> Publisher
+        Objects --> Publisher
+    end
+
+    subgraph Output[생성 데이터]
+        Current[현재 링크]
+        Candidate[주행 후보]
+        Destination[차선변경 목적 링크]
+        Reverse[후방 목표점]
+        Boundary[가상 차선 경계]
+        Projection[장애물 링크 투영]
+    end
+
+    Publisher --> Current
+    Publisher --> Candidate
+    Publisher --> Destination
+    Publisher --> Reverse
+    Publisher --> Boundary
+    Publisher --> Projection
+
+    subgraph Consumer[MACARON 8 활용]
+        Spline[cubic_spline<br/>경로 보간]
+        Tracking[tracking_planner_occupancy<br/>후보 평가 · 경로 선택]
+        Mission[traffic · highway · parking<br/>구간별 주행 판단]
+        Relation[객체-차로 관계 데이터]
+        Control[최종 경로 · 속도 · 조향]
+    end
+
+    Candidate --> Spline --> Tracking
+    Current --> Tracking
+    Destination --> Tracking
+    Boundary --> Tracking
+    Current --> Mission
+    Reverse --> Mission
+    Projection --> Relation
+    Tracking --> Control
 ```
 
-- `path/link_set.json`: MORAI MGeo link 데이터
-- `path/node_set.json`: MORAI MGeo node 데이터
-- `path_planning/dijkstra.py`: link 방향 그래프 구성 및 Dijkstra 최단 경로 탐색
-- `path_planning/morai_link_planner.py`: 지도 로드, 좌표 변환, 최근접 link 탐색, 일반·고정 경로 생성
-- `path_planning/lane_change_candidate.py`: 재사용 가능한 차선 변경 후보 곡선 생성 모듈
-- `path_planning/morai_link.py`: map, 고정 route, current link, 차선 변경 후보 데이터를 발행하는 ROS node
-- `path_planning/visualization.py`: 수신한 map·route·후보 데이터를 RViz marker로 변환하는 ROS node
-- `sensor/data_hub.py`: MORAI GPS/IMU UDP 데이터를 받아 `/current_pose`, `/accel`을 발행하는 ROS node
+## 링크란?
 
-## 동작 구조
+MGeo의 link는 차선의 중앙선을 나타냅니다. 각 link에는 다음 정보가 연결되어 있습니다.
 
-```text
-MORAI GPS/IMU UDP
-        │
-        ▼
-sensor/data_hub.py
-  ├─ /current_pose
-  └─ /accel
-        │
-        ▼
-path_planning/morai_link.py
-  ├─ MoraiMapPlanner
-  │    └─ dijkstra_link()
-  ├─ LaneChangeCandidateGenerator
-  ├─ /morai_map_data
-  ├─ /morai_route_data
-  ├─ /current_link_data
-  └─ /lane_change_candidate_data
-        │
-        ▼
-path_planning/visualization.py
-        │
-        ▼
-RViz Marker / MarkerArray topics
-```
-
-`lane_change_candidate.py`는 별도의 ROS node가 아니라 순수 계산 모듈입니다. `morai_link.py`가 이 모듈을 import해 후보 경로를 계산하고, `visualization.py`는 발행된 결과를 받아 RViz marker로 표현합니다.
-
-## 주요 기능
-
-### 고정 체크포인트 전역 경로
-
-- `FIXED_ROUTE_LINK_IDXS`에 지정된 link를 순서대로 통과
-- 인접한 체크포인트 쌍마다 `dijkstra_link()`를 실행한 뒤 하나의 route로 병합
-- 첫 번째와 마지막 체크포인트가 같은 폐곡선 route만 허용
-- link 길이를 기본 비용으로 사용하고 차선 변경 edge에는 별도 penalty 적용
-- 현재 포함된 MGeo 데이터 기준 40개 route link, 4,392개 path point의 폐곡선 경로 생성 확인
-
-### Current link 추정
-
-1. 전체 고정 route에서 차량과 가장 가까운 route link를 찾습니다.
-2. 현재 route link와 다음 route link를 기본 후보로 구성합니다.
-3. 각 기본 후보에서 연결 가능한 좌·우 차선 변경 목적 link를 추가합니다.
-4. 후보 집합에서 차량과 가장 가까운 link를 다시 선택합니다.
-5. 선택한 link와 terminal node의 속성을 `macaron_8/CurrentLink`로 발행합니다.
-
-`/current_link_data`는 `/current_pose`가 들어올 때마다 갱신됩니다. `can_change_left`, `can_change_right`는 단순히 지도에 좌·우 link가 존재하는지가 아니라 현재 위치에서 유효한 차선 변경 후보 곡선을 실제로 만들 수 있는지에 따라 결정됩니다.
-
-### 차선 변경 후보 경로
-
-- 차량 진행 위치보다 `10 m` 앞에서 후보 경로 시작
-- 좌·우 차선 변경 목적 link를 따라 `20.0 ± 0.05 m` 곡선 생성
-- 3차 Bezier curve를 `101개` point로 샘플링
-- 시작 heading 대비 각 segment의 진행 방향 편차를 `45°` 이내로 제한
-- 짧은 link에서는 다음 forward link까지 연결해 필요한 길이 확보
-- 조건을 만족하는 20 m 경로를 만들 수 없으면 해당 후보를 생성하지 않음
-- 현재 link가 바뀌거나 같은 link에서 진행 거리가 `1 m` 이상 달라지면 후보 재계산
-
-### GPS/IMU 처리
-
-- WGS84 경위도를 UTM Zone 52N(`EPSG:32652`) 좌표로 변환
-- IMU quaternion을 roll, pitch, yaw로 변환
-- `/current_pose`의 `x`, `y`에는 UTM 좌표, `z`에는 yaw(rad) 저장
-- IMU linear acceleration의 `x`, `y`를 `/accel`로 발행
-- 기본 발행 주기 `10 Hz`
-
-## 실행 화면
-
-### RViz 전역 경로 시각화
-
-MORAI link/node map, 전역 경로, 현재 차량 위치를 RViz에 표시한 화면입니다.
-
-![RViz 전역 경로 시각화](docs/images/rviz-global-path-cropped.png)
-
-### MORAI 시뮬레이터 연동
-
-MORAI 차량의 실제 주행 위치와 RViz에 표시되는 전역 경로를 함께 확인할 수 있습니다.
-빨간선이 Dijkstra로 계산된 Global Path이고 분홍색 선이 실제 자동차의 위치가 있는 링크를 나타냅니다.
-
-![MORAI 시뮬레이터와 RViz 전역 경로](docs/images/morai-rviz-driving-cropped.png)
-
-### 회전교차로 경로
-
-회전교차로 구간에서 link 기반으로 생성된 경로와 차량 위치를 비교한 화면입니다.
-
-![회전교차로의 MORAI 시뮬레이터와 RViz 경로](docs/images/morai-rviz-roundabout-cropped.png)
-
-### RViz 색상
-
-- 초록색: MGeo map link
-- 빨간색: 생성된 global path
-- 분홍색: current link
-- 청록색: 좌측 차선 변경 후보
-- 주황색: 우측 차선 변경 후보
-- 노란색 화살표: ego vehicle 위치와 yaw
-
-## 주요 ROS topic
-
-| Topic | Type | Description |
-| --- | --- | --- |
-| `/current_pose` | `geometry_msgs/Point` | 현재 차량 위치. `x`, `y`는 UTM, `z`는 yaw(rad) |
-| `/accel` | `geometry_msgs/Point` | IMU linear acceleration의 `x`, `y` |
-| `/morai_map_data` | `std_msgs/String` | link/node map JSON, latched publish |
-| `/morai_route_data` | `std_msgs/String` | 고정 route link와 path point JSON, latched publish |
-| `/current_link_data` | `macaron_8/CurrentLink` | 현재 link 속성과 실제 차선 변경 후보 존재 여부 |
-| `/lane_change_candidate_data` | `std_msgs/String` | 좌·우 후보 방향, 목적 link, 후보 path JSON, latched publish |
-| `/global_path_marker` | `visualization_msgs/Marker` | global path line marker |
-| `/morai_link_markers` | `visualization_msgs/MarkerArray` | MGeo map link/node marker |
-| `/dijkstra_route_markers` | `visualization_msgs/MarkerArray` | route link 및 시작·종료 point marker |
-| `/ego_vehicle_marker` | `visualization_msgs/Marker` | 현재 차량 위치·yaw arrow marker |
-| `/current_link_marker` | `visualization_msgs/Marker` | 현재 차량이 위치한 link 강조 marker |
-| `/lane_change_candidate_markers` | `visualization_msgs/MarkerArray` | 좌·우 차선 변경 후보 line marker |
-
-## 설정 위치
-
-### 고정 route 및 current link
-
-`path_planning/morai_link.py` 상단에서 다음 값을 변경할 수 있습니다.
-
-```python
-MAP_CREATE = False
-LANE_CHANGE_LOOKAHEAD_M = 20.0
-CURRENT_LINK_LOOKAHEAD_ROUTE_COUNT = 1
-LANE_CHANGE_CANDIDATE_START_AHEAD_M = 10.0
-LANE_CHANGE_CANDIDATE_UPDATE_DISTANCE_M = 1.0
-
-FIXED_ROUTE_LINK_IDXS = [
-    'A2256W000748',
-    'A2256W000329',
-    'A2256W000219',
-    'A2256W000202',
-    'A2256W000308',
-    'A2256W000304',
-    'A2256W000146',
-    'A2256W000846',
-    'A2256W000153',
-    'A2256W000128',
-    'A2256W000332',
-    'A2256W000748'
-]
-```
-
-- `MAP_CREATE`: `True`일 때 route의 UTM `x`, `y`를 `path/donggul.npy`로 저장
-- `LANE_CHANGE_LOOKAHEAD_M`: Dijkstra graph에 차선 변경 edge를 추가할 때 필요한 source/destination link의 최소 전방 거리
-- `CURRENT_LINK_LOOKAHEAD_ROUTE_COUNT`: current link 후보에 포함할 다음 route link 개수
-- `LANE_CHANGE_CANDIDATE_START_AHEAD_M`: 차량 위치에서 후보 경로 시작점까지의 전방 거리
-- `LANE_CHANGE_CANDIDATE_UPDATE_DISTANCE_M`: 같은 link에서 후보 경로를 다시 계산할 최소 진행 거리
-- `FIXED_ROUTE_LINK_IDXS`: 순서대로 통과할 체크포인트 link ID. 폐곡선 route이므로 첫 ID와 마지막 ID가 같아야 함
-
-MORAI local 좌표와 UTM/RViz 변환 원점은 `MoraiMapPublisher.__init__()`에 있습니다.
-
-```python
-self.origin_utm_x = 302595.0
-self.origin_utm_y = 4124145.0
-self.use_utm_offset = True
-self.lane_change_penalty = 20.0
-```
-
-### 차선 변경 후보
-
-`path_planning/lane_change_candidate.py` 상단에서 후보 곡선 조건을 변경할 수 있습니다.
-
-```python
-START_AHEAD_OF_VEHICLE_M = 10.0
-CANDIDATE_PATH_LENGTH_M = 20.0
-CANDIDATE_LENGTH_TOLERANCE_M = 0.05
-CANDIDATE_CURVE_SAMPLES = 101
-MAX_CANDIDATE_HEADING_DEVIATION_DEG = 45.0
-```
-
-`morai_link.py`에서 generator를 생성할 때 `LANE_CHANGE_CANDIDATE_START_AHEAD_M`를 전달하므로 실제 실행 시 후보 시작 거리는 `morai_link.py` 설정을 따릅니다.
-
-### GPS/IMU UDP
-
-`sensor/data_hub.py`의 UDP 설정은 다음과 같습니다.
-
-```python
-GPS_IP = '127.0.0.1'
-GPS_PORT = 9090
-IMU_IP = '127.0.0.1'
-IMU_PORT = 9088
-```
-
-## 커스텀 메시지
-
-`morai_link.py`는 현재 차량이 주행 중인 link 정보를 전달하기 위해 `macaron_8/CurrentLink`를 사용합니다.
-
-```text
-string link_type
-string link_idx
-float64 max_speed
-bool on_stop_line
-string traffic_light_id
-string related_signal
-bool can_change_left
-bool can_change_right
-```
-
-| Field | Source / Meaning |
+| 정보 | 의미 |
 | --- | --- |
-| `link_type` | 현재 link의 MGeo `link_type` |
-| `link_idx` | 현재 link ID |
-| `max_speed` | 현재 link의 제한속도 |
-| `on_stop_line` | 현재 link의 `to_node_idx`가 가리키는 terminal node의 정지선 여부 |
-| `traffic_light_id` | terminal node에 연결된 신호등 ID |
-| `related_signal` | 현재 link의 진행 방향 신호 정보 |
-| `can_change_left` | 현재 위치에서 유효한 좌측 후보 곡선이 생성됐는지 여부 |
-| `can_change_right` | 현재 위치에서 유효한 우측 후보 곡선이 생성됐는지 여부 |
+| `idx` | 링크 고유 ID |
+| `from_node_idx` | 링크 시작 노드 |
+| `to_node_idx` | 링크 종료 노드 |
+| `points` | 도로 중심선을 구성하는 점 |
+| `max_speed` | 제한속도 |
+| `link_type` | 일반도로·교차로 등 도로 종류 |
+| `can_move_left_lane` | 왼쪽 차로로 이동 가능한지 |
+| `can_move_right_lane` | 오른쪽 차로로 이동 가능한지 |
+| `*_lane_change_dst_link_idx` | 차선변경 목적 링크 |
+| `related_signal` | 해당 링크의 신호 진행 방향 |
 
-`on_stop_line`과 `traffic_light_id`는 실시간 신호 상태가 아니라 지도에 저장된 terminal node metadata입니다.
+노드는 여러 링크를 연결하며 정지선 여부와 신호등 ID를 제공합니다. 따라서 현재 link를 알면 차량이 어느 차로에 있는지뿐 아니라 앞으로 만날 교차로와 신호 정보도 함께 알 수 있습니다.
+
+## 1. 지도 구성
+
+[morai_link_planner.py](path_planning/link/morai_link_planner.py)는 `link_set.json`과 `node_set.json`을 읽어 도로망을 구성합니다.
+
+### 좌표 변환
+
+MGeo의 로컬 좌표에 지도 원점을 더해 UTM 좌표를 만듭니다.
+
+```text
+origin_utm_x = 302595.0
+origin_utm_y = 4124145.0
+
+utm_x = morai_x + origin_utm_x
+utm_y = morai_y + origin_utm_y
+```
+
+내부 후보 곡선 계산에는 원점을 뺀 로컬 좌표를 사용하고, 경로계획기로 발행할 때는 다시 UTM 좌표로 변환합니다.
+
+### 검색 자료구조
+
+차량 위치가 들어올 때마다 모든 지도 점을 순차 탐색하지 않도록 다음 자료를 미리 만듭니다.
+
+- 링크 ID에서 링크를 찾는 `link_by_idx`
+- 노드에서 시작하는 링크 목록 `links_by_from_node`
+- 노드로 들어오는 링크 목록 `links_by_to_node`
+- 좌우 차로 관계 `lane_neighbor_idxs_by_link_idx`
+- 모든 링크 선분의 시작점, 방향벡터, 길이, heading을 담은 NumPy 배열
+
+포함된 지도는 link 634개, node 480개, 선분 74,782개로 구성됩니다.
+
+## 2. GLOBAL PATH와 검색범위
+
+[morai_link.py](path_planning/link/morai_link.py)의 `CURRENT_LINK_ROUTE_LINK_IDXS`는 차량이 주행할 링크 순서를 정의합니다.
+
+- route 항목: 40개
+- 고유 route link: 39개
+- 전체 길이: 약 2.185km
+- 시작과 끝: `A2256W000748`
+
+첫 링크와 마지막 링크가 같기 때문에 경로는 한 바퀴를 순환하는 폐회로입니다.
+
+차량이 실제 route 옆 차로로 이동할 수 있으므로 route link만 검색하지 않습니다. 각 route link에서 최대 세 번의 좌우 차선 이동으로 도달할 수 있는 링크까지 확장해 55개의 현재 링크 후보를 구성합니다. 이 후보에 포함된 7,560개 선분이 실시간 위치 검색에 사용됩니다.
+
+## 3. 현재 링크 생성
+
+`/current_pose`는 다음 정보를 제공합니다.
+
+```text
+point.x = 차량 UTM Easting
+point.y = 차량 UTM Northing
+point.z = 차량 yaw [rad]
+```
+
+차량 점을 각 후보 선분 위에 직교 투영하고 투영점까지의 거리가 가장 짧은 선분을 찾습니다. yaw가 있으면 차량과 링크의 진행 방향도 함께 비교합니다.
+
+```text
+차량 위치 P
+     │
+     │ 최단거리
+     ▼
+A────────────Q────────────B   선택된 link segment
+             ▲
+          투영점
+```
+
+선택된 링크와 종료 노드의 정보를 조합해 `CurrentLink` 메시지를 만듭니다.
+
+| 필드 | 만들어지는 값 | MACARON 8에서의 사용 |
+| --- | --- | --- |
+| `link_idx` | 현재 링크 ID | 현재 차로와 mission 구간 식별 |
+| `link_type` | 도로 종류 | 교차로 여부와 경로 생성 범위 결정 |
+| `max_speed` | 링크 제한속도 | 도로 속도 정보로 보관 |
+| `on_stop_line` | 종료 노드의 정지선 여부 | 정지선 상태 정보 |
+| `traffic_light_id` | 종료 노드의 신호등 ID | 신호등과 링크 연결 |
+| `related_signal` | 직진·좌회전 등 관련 신호 | 진행 방향별 신호 정보 |
+| `can_change_left/right` | 실제 후보 곡선 생성 가능 여부 | 불가능한 방향의 경로 생성과 후방 탐색 제외 |
+| `intersection_type` | 신호등·회전교차로·고속도로·톨게이트 등의 수동 label | traffic 및 mission planner 상태 전환 |
+
+`can_change_left/right`는 지도 플래그를 그대로 복사하지 않습니다. 현재 위치에서 해당 방향으로 충분한 후보 곡선을 실제로 만들 수 있을 때만 `true`가 됩니다.
+
+MACARON 8에서는 이 메시지를 여러 모듈이 함께 사용합니다.
+
+- `tracking_planner_occupancy.py`: 차선변경 방향 제한, 교차로 판정, 가드레일 끝과 톨게이트 진입 상태 판단
+- `highway_planner.py`: `LANE_1`, `LANE_2`, `LANE_3` label을 이용한 의무 차선변경
+- `traffic.py`: 3구·4구 신호등 인식 방식 선택
+- `back.py`: 차선변경이 불가능한 방향의 후방 차량 검출 결과 제외
+
+## 4. 주행 후보 경로
+
+모듈은 차량 위치를 기준으로 최대 세 종류의 경로를 만듭니다.
+
+| Candidate ID | 이름 | 의미 |
+| ---: | --- | --- |
+| 0 | center | 현재 차로 유지 |
+| 1 | left | 왼쪽 목적 링크로 차선변경 |
+| 2 | right | 오른쪽 목적 링크로 차선변경 |
+
+### Center 후보
+
+차량 투영점에서 시작해 현재 링크 중심선을 따라갑니다. 링크 끝에 도달하면 route의 다음 링크로 넘어가며 총 40m의 중심선 경로를 수집합니다.
+
+```text
+현재 link             다음 link
+──────●───────────────●──────────────────>
+      차량 투영점        중심선 연결
+```
+
+### Left/Right 후보
+
+[lane_change_candidate.py](path_planning/link/lane_change_candidate.py)는 현재 링크의 차선변경 목적 링크를 찾고 시작점과 목적 링크의 진행 방향을 연결하는 3차 Bezier curve를 생성합니다.
+
+```text
+source link       P0 ───────────────>
+                    ╲
+                     ╲  Bezier candidate
+                      ╲
+destination link       ╲──── P3 ───>
+```
+
+후보의 기본 특성은 다음과 같습니다.
+
+- 목표 길이 40m
+- 목적 링크가 짧으면 다음 연결 링크까지 확장
+- 확보 가능한 거리가 부족하면 최소 16m까지 축소
+- 목표 길이 오차 0.15m 이내
+- 약 0.5m 간격으로 Bezier 점 생성
+- 차량이 같은 링크에서 1m 이상 진행하면 후보 갱신
+
+목적 링크의 끝점을 바꿔 가며 Bezier 길이를 계산하고, 이분 탐색으로 약 40m가 되는 끝점을 찾습니다.
+
+## 5. 후보 경로가 최종 경로로 사용되는 과정
+
+`morai_link`가 만드는 후보는 지도 중심선과 Bezier 점으로 구성된 1차 경로입니다. MACARON 8에서는 `cubic_spline.cpp`가 이를 약 0.1m 간격의 부드러운 spline으로 바꿉니다.
+
+```text
+/lane_change_candidate_data
+  x, y, candidate_id
+            │
+            ▼
+       cubic_spline
+            │
+            ▼
+/lane_change_candidate_spline
+  x, y, yaw, curvature, candidate_id
+```
+
+`tracking_planner_occupancy.py`는 spline을 candidate ID별로 나누어 center, left, right 경로로 저장합니다. 이후 각 경로를 동적 점유격자와 비교하고 다음 조건을 함께 적용합니다.
+
+- 정적·동적 장애물과의 충돌 가능성
+- 현재 링크에서 허용되는 차선변경 방향
+- 차량의 횡방향 위치와 속도
+- 교차로·터널·고속도로 등 현재 구간 상태
+- 후방 차량 상태
+- 링크 기반 목적 차로
+
+이 평가를 통과한 후보가 실제 조향과 속도 계산에 사용할 최종 경로가 됩니다.
+
+## 6. 차선변경 목적 링크
+
+`/lane_change_candidate_link`는 Bezier 곡선이 아니라 차선변경 후 따라갈 **목적 링크의 원본 중심선**을 제공합니다.
+
+```text
+x, y, candidate_id, link_order
+```
+
+`link_order`는 목적 경로가 여러 링크로 이어질 때 링크 순서를 나타냅니다. `tracking_planner_occupancy.py`는 left/right별 중심선을 복원해 다음 목적으로 사용합니다.
+
+- 차선변경 후보 생성
+- 차선변경이 시작된 뒤 목적 링크 중심선 추종
+- 일반 lattice 경로가 적합하지 않을 때 link 기반 경로 유지
+
+## 7. 후방 목표점
+
+[reverse_link.py](path_planning/link/reverse_link.py)는 현재 위치에서 링크 진행 방향을 거슬러 기본 8m 뒤의 목표점을 찾습니다.
+
+현재 링크 안에서 거리가 부족하면 이전 링크로 넘어갑니다. 분기점에서는 실제로 관측한 직전 링크, route에 정의된 이전 링크, heading 연결 순서로 자연스러운 이전 링크를 선택합니다.
+
+```text
+이전 link                  현재 link
+──── target ◀──────────── vehicle ────────────>
+       8m
+```
+
+결과는 다음 형태입니다.
+
+```text
+Point.x = 목표 UTM x
+Point.y = 목표 UTM y
+Point.z = 목표 진행 yaw
+```
+
+MACARON 8의 parking planner는 후진 상태에서 이 점을 목표 pose로 사용합니다.
+
+## 8. 가상 차선 경계
+
+[virtual_lane_boundary.py](path_planning/link/virtual_lane_boundary.py)는 중앙선 정보가 추가로 필요한 지정 구간에서 링크 중심선을 왼쪽으로 1.15m 이동한 가상 경계를 만듭니다.
+
+```text
+가상 좌측 경계  ─────────────────────
+                  1.15m
+링크 중심선      ─────────────────────>
+```
+
+현재 적용 구간은 다음과 같습니다.
+
+```text
+A2256W000304 → A2256W000148
+A2256W000213
+```
+
+`mppsl_sl_occupancy.py`는 이 경계를 Frenet `s-q` 좌표로 변환합니다. 이후 장애물 필터와 후보 경로 평가에서 차량이 넘어가면 안 되는 가상의 노란 중앙선으로 사용합니다.
+
+## 9. 동적 장애물의 링크 투영
+
+[dynamic_obstacle_link_projector.py](path_planning/link/dynamic_obstacle_link_projector.py)는 YOLO-LiDAR fusion이 추적한 이동 객체를 도로 링크 위에 투영합니다.
+
+처리 대상은 다음 조건을 만족하는 객체입니다.
+
+- 이동 상태가 `MOVING`
+- 진행 방향이 유효함
+- 자차에서 50m 이내
+
+객체와 가장 가까운 주행 가능 링크 선분을 찾고 객체 heading과 링크 heading을 비교합니다. 결과에는 다음 정보가 포함됩니다.
+
+| 결과 | 의미 |
+| --- | --- |
+| `track_id` | 객체 추적 ID |
+| `nearest_link_idx` | 객체가 속한 것으로 판단한 링크 |
+| `projected_position_utm` | 링크 중심선 위의 투영점 |
+| `ego_distance_m` | 자차와 객체 사이 거리 |
+| `signed_link_distance_m` | 링크 중심선 기준 횡방향 거리 |
+| `signed_heading_error_rad` | 링크와 객체 진행 방향 차이 |
+
+횡방향 거리는 링크 진행 방향을 기준으로 왼쪽이 양수, 오른쪽이 음수입니다.
+
+```text
+          object (+distance)
+              ●
+              │
+link  ────────●────────────────>
+          projection
+```
+
+이 데이터는 단순한 객체 UTM 좌표를 “어느 차로의 어느 쪽에 있는 객체인가”라는 도로 기준 정보로 변환한 결과입니다.
+
+## 생성되는 ROS 데이터
+
+| Topic | Type | 만들어지는 정보 | 주요 사용처 |
+| --- | --- | --- | --- |
+| `/morai_map_data` | `std_msgs/String` | 전체 link/node와 좌표·속성 | 지도 및 RViz 시각화 |
+| `/current_link_data` | `macaron_8/CurrentLink` | 현재 도로 상태 | tracking, highway, traffic, rear vision |
+| `/lane_change_candidate_data` | `sensor_msgs/PointCloud2` | center/left/right 기하 경로 | cubic spline 보간 |
+| `/lane_change_candidate_link` | `sensor_msgs/PointCloud2` | 목적 링크 중심선 | 차선변경 및 목적 차로 추종 |
+| `/reverse_link_point` | `geometry_msgs/Point` | 링크 기준 후방 목표 pose | 후진·주차 경로 |
+| `/current_link_virtual_lane_boundaries` | `sensor_msgs/PointCloud2` | 가상 좌측 중앙선 | 경로·장애물 제약 |
+| `/dynamic_obstacle_link_data` | `macaron_8/DynamicObstacleLinkArray` | 객체의 링크 소속과 상대 위치 | 객체-차로 관계 표현 |
+
+## 모듈 구성
+
+```text
+path_planning/link/
+├── morai_link.py
+│   └── ROS 입출력과 전체 처리 순서
+├── morai_link_planner.py
+│   └── 지도 로드, 좌표 변환, 그래프와 최근접 검색
+├── lane_change_candidate.py
+│   └── center/left/right 후보 경로
+├── reverse_link.py
+│   └── 링크를 따라가는 후방 목표점
+├── virtual_lane_boundary.py
+│   └── 중심선 offset 기반 가상 경계
+└── dynamic_obstacle_link_projector.py
+    └── 동적 객체의 링크 투영
+```
+
+`msg/`에는 위 결과를 표현하는 ROS 메시지 구조가 있고, `path/MGeo/`에는 분석에 사용한 link/node 지도가 있습니다.
+
+더 세부적인 함수 단위 처리 순서는 [Architecture](docs/ARCHITECTURE.md)에 정리되어 있습니다.
+
+## 시각화 예시
+
+아래 이미지는 MGeo 도로망, 생성 경로와 차량 위치를 MORAI/RViz에서 비교한 결과입니다.
+
+![RViz 전역 경로](docs/images/rviz-global-path-cropped.png)
+
+![MORAI와 RViz 주행 위치 비교](docs/images/morai-rviz-driving-cropped.png)
+
+![회전교차로 링크 경로](docs/images/morai-rviz-roundabout-cropped.png)

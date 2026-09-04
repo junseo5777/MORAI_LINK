@@ -1,0 +1,9 @@
+string link_type
+string link_idx
+float64 max_speed
+bool on_stop_line
+string traffic_light_id
+string related_signal
+bool can_change_left
+bool can_change_right
+string intersection_type
