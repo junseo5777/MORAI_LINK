@@ -14,55 +14,16 @@ MGeo에는 도로 중심선, 링크 연결 관계, 제한속도, 차선변경 �
 
 ## 전체 동작 흐름
 
-```mermaid
-flowchart LR
-    subgraph Input[입력]
-        Map[(MGeo<br/>link · node)]
-        Pose[/current_pose<br/>UTM x · y · yaw]
-        Objects[YOLO-LiDAR<br/>동적 객체]
-    end
-
-    subgraph Core[morai_link]
-        Planner[MoraiMapPlanner<br/>좌표 변환 · 그래프 · 최근접 검색]
-        Publisher[MoraiMapPublisher<br/>현재 위치 기반 데이터 생성]
-        Map --> Planner --> Publisher
-        Pose --> Publisher
-        Objects --> Publisher
-    end
-
-    subgraph Output[생성 데이터]
-        Current[현재 링크]
-        Candidate[주행 후보]
-        Destination[차선변경 목적 링크]
-        Reverse[후방 목표점]
-        Boundary[가상 차선 경계]
-        Projection[장애물 링크 투영]
-    end
-
-    Publisher --> Current
-    Publisher --> Candidate
-    Publisher --> Destination
-    Publisher --> Reverse
-    Publisher --> Boundary
-    Publisher --> Projection
-
-    subgraph Consumer[MACARON 8 활용]
-        Spline[cubic_spline<br/>경로 보간]
-        Tracking[tracking_planner_occupancy<br/>후보 평가 · 경로 선택]
-        Mission[traffic · highway · parking<br/>구간별 주행 판단]
-        Relation[객체-차로 관계 데이터]
-        Control[최종 경로 · 속도 · 조향]
-    end
-
-    Candidate --> Spline --> Tracking
-    Current --> Tracking
-    Destination --> Tracking
-    Boundary --> Tracking
-    Current --> Mission
-    Reverse --> Mission
-    Projection --> Relation
-    Tracking --> Control
-```
+| 단계 | 입력 | 처리 | 생성 결과 | MACARON 8에서의 사용 |
+| ---: | --- | --- | --- | --- |
+| 1. 지도 구성 | MGeo link/node | 좌표 변환, 링크 그래프와 최근접 검색 배열 생성 | 정규화된 도로망 | 이후 모든 링크 기반 계산의 기준 |
+| 2. 현재 위치 반영 | `/current_pose`의 UTM x, y, yaw | 차량 위치를 도로 선분에 투영 | 현재 링크와 도로 속성 | 경로계획 및 mission 구간 판단 |
+| 3. 주행 후보 생성 | 현재 링크와 좌우 차로 연결 관계 | 중심선 연결 및 Bezier 차선변경 곡선 계산 | center/left/right 후보 | spline 보간 후 후보 평가와 경로 선택 |
+| 4. 목적 차로 구성 | 차선변경 목적 링크 | 여러 목적 링크의 중심선을 순서대로 결합 | 좌우 목적 링크 경로 | 차선변경 시작 후 목적 차로 추종 |
+| 5. 후방 기준 생성 | 현재 위치와 이전 링크 | 링크를 역방향으로 따라가며 목표점 계산 | 8m 후방 목표 pose | 후진 및 주차 경로 생성 |
+| 6. 가상 경계 생성 | 중앙선 보강 대상 링크 | 중심선을 왼쪽으로 1.15m 이동 | 가상 차선 경계 | 경로와 장애물 평가의 중앙선 제약 |
+| 7. 장애물 링크 변환 | YOLO-LiDAR 동적 객체 | 객체를 진행 가능한 링크 중심선에 투영 | 링크 ID, 투영점, 횡거리, 방향 오차 | 객체와 차로의 관계 표현 |
+| 8. 최종 경로 선택 | 위에서 생성된 링크·후보·경계 정보 | 점유격자 및 주행 조건과 함께 후보 평가 | 최종 경로, 속도, 조향 | 차량 제어 |
 
 ## 링크란?
 
