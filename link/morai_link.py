@@ -34,6 +34,7 @@ DEFAULT_REVERSE_TARGET_PUBLISH_HZ = 10.0 # hz
 # morai_link_planner.py 관련 기본 설정
 CURRENT_LINK_REACQUIRE_DISTANCE_M = 4.0  # 기존 링크에서 이 이상 멀어지면 전체 후보에서 링크 재탐색 [m]
 CURRENT_LINK_MAX_LANE_CHANGE_COUNT = 3  # 현재 링크 및 후보 경로 확장에 허용할 최대 좌우 차선 이동 횟수
+DEFAULT_CURRENT_LINK_CHANGE_CONFIRM_COUNT = 10  # 다른 링크로 전환하기 위한 연속 관측 횟수
 DEFAULT_INTERSECTION_PREVIEW_DISTANCE_M = 10.0  # 다음 링크가 교차로이면 이 거리 전부터 link_type=1 발행 [m]
 
 # lane_change_candidate.py 관련 기본 설정
@@ -78,6 +79,12 @@ INTERSECTION_TYPE_BY_LINK_IDX = {
     'A2256W000435': 'LANE_1',
     'A2256W000153': 'TOLLGATE_ENTRY',
     'A2256W000148': 'guardrail_endpoint'
+}
+
+DEFAULT_INTERSECTION_TYPE_PREVIEW_DISTANCE_M_BY_LINK_IDX = {
+    'A2256W000213': 25.0,
+    'A2256W000308': 20.0,
+    'A2256W000315': 20.0
 }
 
 VIRTUAL_LEFT_CENTER_LINE_LINK_IDX_GROUPS = (
@@ -145,7 +152,7 @@ class MoraiMapPublisher:
         # 구독 토픽
         self.current_pose_topic = '/current_pose'
         self.dynamic_obstacle_input_topic = (
-            '/yolo_lidar_fusion/dynamic_points'
+            '/yolo_lidar_fusion/dynamic_objects'
         )
 
         # 발행 토픽
@@ -175,6 +182,21 @@ class MoraiMapPublisher:
             '~intersection_preview_distance_m',
             DEFAULT_INTERSECTION_PREVIEW_DISTANCE_M
         )
+        self.current_link_change_confirm_count = self.bounded_int_param(
+            '~current_link_change_confirm_count',
+            DEFAULT_CURRENT_LINK_CHANGE_CONFIRM_COUNT,
+            1,
+            1000
+        )
+        self.intersection_type_preview_distance_m_by_link_idx = {
+            link_idx: self.positive_float_param(
+                '~intersection_type_preview_distance_m/%s' % link_idx,
+                default_distance_m
+            )
+            for link_idx, default_distance_m in (
+                DEFAULT_INTERSECTION_TYPE_PREVIEW_DISTANCE_M_BY_LINK_IDX.items()
+            )
+        }
         self.dynamic_obstacle_max_distance_m = self.positive_float_param(
             '~dynamic_obstacle_max_distance_m',
             DYNAMIC_OBSTACLE_MAX_DISTANCE_M
@@ -267,6 +289,8 @@ class MoraiMapPublisher:
 
         self.planner = None
         self.current_link_idx = None
+        self.pending_current_link_idx = None
+        self.pending_current_link_count = 0
         self.current_pose = None
         self.current_link_allowed_link_idxs = []
         self.current_link_allowed_link_idx_set = set()
@@ -323,6 +347,19 @@ class MoraiMapPublisher:
             self.reverse_target_distance_m,
             self.reverse_target_publish_hz,
             self.reverse_target_topic
+        )
+        rospy.loginfo(
+            'Intersection-type preview distances: %s',
+            ', '.join(
+                '%s=%.2fm' % (link_idx, distance_m)
+                for link_idx, distance_m in (
+                    self.intersection_type_preview_distance_m_by_link_idx.items()
+                )
+            )
+        )
+        rospy.loginfo(
+            'Current-link change confirmation count: %d',
+            self.current_link_change_confirm_count
         )
         rospy.loginfo(
             'Dynamic obstacle link projector enabled: '
@@ -791,6 +828,12 @@ class MoraiMapPublisher:
 
     def publish_current_link_info(self, utm_x, utm_y, yaw=None):
         nearest = self.find_current_link(utm_x, utm_y, yaw)
+        nearest = self.confirm_current_link_candidate(
+            nearest,
+            utm_x,
+            utm_y,
+            yaw
+        )
 
         if nearest is None:
             self.publish_virtual_lane_boundaries(None)
@@ -852,8 +895,95 @@ class MoraiMapPublisher:
             traffic_light_id,
             link.get('related_signal'),
             can_change_left,
-            can_change_right
+            can_change_right,
+            self.get_published_intersection_type(
+                link,
+                nearest['segment_index'],
+                nearest['segment_ratio']
+            )
         )
+
+    def confirm_current_link_candidate(
+        self,
+        nearest,
+        utm_x,
+        utm_y,
+        yaw=None
+    ):
+        """다른 링크가 설정 횟수만큼 연속 관측될 때만 현재 링크를 변경한다."""
+        if nearest is None:
+            self.pending_current_link_idx = None
+            self.pending_current_link_count = 0
+            return None
+
+        candidate_link = nearest.get('link')
+        candidate_link_idx = (
+            None
+            if candidate_link is None or candidate_link.get('idx') is None
+            else str(candidate_link.get('idx'))
+        )
+
+        if candidate_link_idx is None:
+            self.pending_current_link_idx = None
+            self.pending_current_link_count = 0
+            return None
+
+        if self.current_link_idx is None:
+            self.pending_current_link_idx = None
+            self.pending_current_link_count = 0
+            return nearest
+
+        if candidate_link_idx == self.current_link_idx:
+            self.pending_current_link_idx = None
+            self.pending_current_link_count = 0
+            return nearest
+
+        if candidate_link_idx == self.pending_current_link_idx:
+            self.pending_current_link_count += 1
+        else:
+            self.pending_current_link_idx = candidate_link_idx
+            self.pending_current_link_count = 1
+
+        if (
+            self.pending_current_link_count
+            >= self.current_link_change_confirm_count
+        ):
+            rospy.loginfo(
+                'Current link changed after %d consecutive observations: '
+                '%s -> %s',
+                self.pending_current_link_count,
+                self.current_link_idx,
+                candidate_link_idx
+            )
+            self.pending_current_link_idx = None
+            self.pending_current_link_count = 0
+            return nearest
+
+        rospy.logdebug(
+            'Pending current-link change: %s -> %s (%d/%d)',
+            self.current_link_idx,
+            candidate_link_idx,
+            self.pending_current_link_count,
+            self.current_link_change_confirm_count
+        )
+
+        current_nearest = self.planner.find_nearest_link_and_segment(
+            float(utm_x),
+            float(utm_y),
+            yaw=yaw,
+            candidate_link_idxs=[self.current_link_idx]
+        )
+
+        if current_nearest is None:
+            rospy.logwarn_throttle(
+                2.0,
+                'Unable to retain current link %s while candidate %s is '
+                'pending',
+                self.current_link_idx,
+                candidate_link_idx
+            )
+
+        return current_nearest
 
     def get_published_link_type(
         self,
@@ -889,6 +1019,33 @@ class MoraiMapPublisher:
             return current_link_type
 
         return '1'
+
+    def get_published_intersection_type(
+        self,
+        current_link,
+        current_segment_index,
+        current_segment_ratio
+    ):
+        """지정된 신호등 링크는 끝점 부근에서만 intersection_type을 발행한다."""
+        link_idx = current_link.get('idx')
+        link_idx = '' if link_idx is None else str(link_idx)
+        intersection_type = INTERSECTION_TYPE_BY_LINK_IDX.get(link_idx, '')
+        preview_distance_m = (
+            self.intersection_type_preview_distance_m_by_link_idx.get(link_idx)
+        )
+
+        if preview_distance_m is None:
+            return intersection_type
+
+        if not self.is_near_link_end(
+            current_link,
+            current_segment_index,
+            current_segment_ratio,
+            preview_distance_m
+        ):
+            return ''
+
+        return intersection_type
 
     def is_near_link_end(
         self,
@@ -1251,7 +1408,8 @@ class MoraiMapPublisher:
         traffic_light_id,
         related_signal,
         can_change_left,
-        can_change_right
+        can_change_right,
+        intersection_type
     ):
         msg = CurrentLink()
         msg.link_idx = '' if link_idx is None else str(link_idx)
@@ -1262,9 +1420,8 @@ class MoraiMapPublisher:
         msg.related_signal = '' if related_signal is None else str(related_signal)
         msg.can_change_left = bool(can_change_left)
         msg.can_change_right = bool(can_change_right)
-        msg.intersection_type = INTERSECTION_TYPE_BY_LINK_IDX.get(
-            msg.link_idx,
-            ''
+        msg.intersection_type = (
+            '' if intersection_type is None else str(intersection_type)
         )
         self.current_link_pub.publish(msg)
 
