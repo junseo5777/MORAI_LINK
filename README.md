@@ -1,8 +1,8 @@
-# morai_link
+# MORAI_LINK
 
-MORAI MGeo 정밀도로지도의 link/node 데이터를 실제 자율주행 판단에 사용할 수 있도록 가공한 **MACARON 8 링크 기반 주행 정보 생성**입니다.
+MORAI MGeo 정밀도로지도의 link/node 데이터를 실제 자율주행 판단에 사용할 수 있도록 가공한 **링크 기반 주행 정보 생성 및 처리** 입니다.
 
-이 저장소는 `macaron_8/src/path_planning/link`에서 구현한 링크 데이터 처리 코드와 그 결과를 정리한 프로젝트 기록입니다. MACARON 8 시스템에서 구성한 링크 기반 기능, 관련 메시지 구조, 사용한 MGeo 데이터를 담았습니다.
+macaron_8/src/path_planning/link`에서 구현한 링크 데이터 처리 코드와 그 결과를 정리한 프로젝트 기록입니다. MACARON 8 시스템에서 구성한 링크 기반 기능, 관련 메시지 구조, 사용한 MGeo 데이터를 담았습니다.
 
 ## 프로젝트 목표
 
