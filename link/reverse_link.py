@@ -4,16 +4,15 @@
 import math
 
 
-POINT_EPSILON_M = 1e-6
-
-
 class ReverseLinkTargetFinder:
     def __init__(
         self,
         link_by_idx,
         links_by_to_node,
+        max_previous_link_hops,
+        point_epsilon_m,
+        previous_link_override_by_link_idx,
         route_link_idxs=None,
-        max_previous_link_hops=100
     ):
         self.link_by_idx = link_by_idx
         self.links_by_to_node = links_by_to_node
@@ -21,6 +20,17 @@ class ReverseLinkTargetFinder:
             1,
             int(max_previous_link_hops)
         )
+        self.point_epsilon_m = max(0.0, float(point_epsilon_m))
+        self.previous_link_override_by_link_idx = {
+            str(current_link_idx): str(previous_link_idx)
+            for current_link_idx, previous_link_idx in (
+                previous_link_override_by_link_idx.items()
+            )
+            if (
+                str(current_link_idx) in self.link_by_idx
+                and str(previous_link_idx) in self.link_by_idx
+            )
+        }
         self.route_previous_by_link_idx = {}
         self.observed_previous_by_link_idx = {}
         self.last_current_link_idx = None
@@ -196,6 +206,19 @@ class ReverseLinkTargetFinder:
         if current_link is None:
             return None
 
+        override_link_idx = self.previous_link_override_by_link_idx.get(
+            current_link_idx
+        )
+
+        if (
+            override_link_idx is not None
+            and override_link_idx not in visited_link_idxs
+            and len(
+                self.link_by_idx[override_link_idx].get('points', [])
+            ) >= 2
+        ):
+            return override_link_idx
+
         from_node_idx = current_link.get('from_node_idx')
 
         if from_node_idx is None:
@@ -285,7 +308,7 @@ class ReverseLinkTargetFinder:
             if self.point_distance(
                 target_point,
                 next_point
-            ) > POINT_EPSILON_M:
+            ) > self.point_epsilon_m:
                 return next_point
 
         if forward_link is not None:
@@ -293,7 +316,7 @@ class ReverseLinkTargetFinder:
                 if self.point_distance(
                     target_point,
                     next_point
-                ) > POINT_EPSILON_M:
+                ) > self.point_epsilon_m:
                     return next_point
 
         return None

@@ -4,6 +4,7 @@
 import json
 import math
 import sys
+import threading
 from pathlib import Path
 
 import rospy
@@ -14,55 +15,80 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header, String
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from path_planning.link.morai_link_planner import MoraiMapPlanner
+from path_planning.link.morai_link_planner import (
+    CURRENT_LINK_CHANGE_CONFIRM_COUNT,
+    CURRENT_LINK_MAX_LANE_CHANGE_COUNT,
+    CURRENT_LINK_REACQUIRE_DISTANCE_M,
+    CURRENT_LINK_ROUTE_LINK_IDXS,
+    MoraiMapPlanner,
+)
 from path_planning.link.lane_change_candidate import LaneChangeCandidateGenerator
 from path_planning.link.reverse_link import ReverseLinkTargetFinder
+from path_planning.link.tunnel_reverse import TUNNEL_LINK_BY_LANE, TUNNEL_LANE_BY_LINK
 from path_planning.link.virtual_lane_boundary import VirtualLaneBoundaryGenerator
-from path_planning.link.dynamic_obstacle_link_projector import DynamicObstacleLinkProjector
-from macaron_8.msg import (
-    CurrentLink,
-    DynamicObstacleLink,
-    DynamicObstacleLinkArray,
-    FusedObjectArray,
-)
+from macaron_8.msg import CurrentLink
 
 
-# reverse_link.py 관련 기본 설정
-DEFAULT_REVERSE_TARGET_DISTANCE_M = 8.0
-DEFAULT_REVERSE_TARGET_PUBLISH_HZ = 10.0 # hz
+# 현재 링크 발행 설정
+DEFAULT_INTERSECTION_PREVIEW_DISTANCE_M = 15.0  # 교차로 link_type 사전 발행 거리 [m]
 
-# morai_link_planner.py 관련 기본 설정
-CURRENT_LINK_REACQUIRE_DISTANCE_M = 4.0  # 기존 링크에서 이 이상 멀어지면 전체 후보에서 링크 재탐색 [m]
-CURRENT_LINK_MAX_LANE_CHANGE_COUNT = 3  # 현재 링크 및 후보 경로 확장에 허용할 최대 좌우 차선 이동 횟수
-DEFAULT_CURRENT_LINK_CHANGE_CONFIRM_COUNT = 10  # 다른 링크로 전환하기 위한 연속 관측 횟수
-DEFAULT_INTERSECTION_PREVIEW_DISTANCE_M = 10.0  # 다음 링크가 교차로이면 이 거리 전부터 link_type=1 발행 [m]
+# 후방 목표점 설정
+DEFAULT_REVERSE_TARGET_DISTANCE_M = 8.0  # 차량 뒤 목표 거리 [m]
+DEFAULT_REVERSE_TARGET_PUBLISH_HZ = 10.0  # 후방 목표점 발행 주기 [Hz]
+REVERSE_SEARCH_MAX_PREVIOUS_LINKS = 10  # 후방 탐색 최대 링크 수
+REVERSE_POINT_EQUALITY_EPSILON_M = 1e-6  # 연결점 동일 판정 오차 [m]
+REVERSE_PREVIOUS_LINK_OVERRIDE_BY_LINK_IDX = {  # 분리된 시작 노드의 이전 링크 지정
+    'A2256W000009': 'A2256W000220',
+    'A2256W000131': 'A2256W000448',
+}
 
-# lane_change_candidate.py 관련 기본 설정
-LANE_CHANGE_CANDIDATE_UPDATE_DISTANCE_M = 1.0  # 후보 경로를 다시 생성하는 차량 진행간격 [m]
+# 차선 변경 후보 설정
+LANE_CHANGE_CANDIDATE_UPDATE_DISTANCE_M = 1.0  # 정적 목적 링크 결과의 캐시 재사용 거리 [m]
+DEFAULT_LANE_CHANGE_CANDIDATE_PUBLISH_HZ = 12.0  # 후보 경로 발행 주기 [Hz]
 LANE_CHANGE_CANDIDATE_START_AHEAD_M = 0.0  # 차량 투영점에서 후보 경로 시작점까지의 전방거리 [m]
-LANE_CHANGE_CANDIDATE_ID_BY_SIDE = {
+LANE_CHANGE_CANDIDATE_PATH_LENGTH_M = 40.0  # 기본 후보 경로 길이 [m]
+LANE_CHANGE_CANDIDATE_MIN_PATH_LENGTH_M = 16.0  # 허용할 최소 후보 경로 길이 [m]
+LANE_CHANGE_CANDIDATE_LENGTH_TOLERANCE_M = 0.15  # 후보 길이 허용 오차 [m]
+LANE_CHANGE_CANDIDATE_POINT_INTERVAL_M = 0.5  # 좌우 후보 표본 간격 [m]
+HIGHWAY_CANDIDATE_PATH_EXTENSION_M = 40.0  # 고속도로 후보 끝의 차선 중심선 연장 길이 [m]
+LANE_CHANGE_ENDPOINT_NO_NEXT_LINK_IDXS = {'A2256W000445', 'A2256W000422'} # 다음 링크로 차선 변경 후보 넘어가지 않도록
+LANE_CHANGE_PATH_LENGTH_OVERRIDES_M = {'A2256W000445': 20.0}   # 차선 변경 후보 길이 조정 [m]
+
+LANE_CHANGE_CANDIDATE_ID_BY_SIDE = {  # 후보 방향별 PointCloud 식별자
     'center': 0,
     'left': 1,
     'right': 2
 }
+LANE_CHANGE_MIN_PROGRESS_M_BY_LINK_AND_SIDE = {('A2256W000202', 'right'): 0.1}  # 링크·방향별 차선 변경 허용 시작거리 [m]
 
-# virtual_lane_boundary.py 관련 기본 설정
-VIRTUAL_CENTER_LINE_LANE_WIDTH_M = 2.3 # 가상 좌측 중앙선 생성 시 기준 차선 폭 [m]
+# 가상 차선 경계 설정
+VIRTUAL_CENTER_LINE_LANE_WIDTH_M = 3.5  # 가상 차선 경계 기준 차선 폭 [m]
+VIRTUAL_CONNECTED_POINT_TOLERANCE_M = 1e-3  # 링크 연결점 동일 판정 오차 [m]
+VIRTUAL_LANE_BOUNDARY_LINK_IDX_GROUPS = (  # 함께 발행할 가상 차선 경계 링크 묶음
+    (
+        'A2256W000304',
+        'A2256W000148'
+    ),
+    (
+        'A2256W000213',
+    ),
+    (
+        'A2256W000126',
+        'A2256W000131',
+    )
+)
+VIRTUAL_RIGHT_BOUNDARY_LINK_IDXS = {  # 보정된 링크 진행 방향 기준 오른쪽 경계
+    'A2256W000126'
+}
 
-# dynamic_obstacle_link_projector.py 관련 기본 설정
-DYNAMIC_OBSTACLE_MAX_DISTANCE_M = 50.0
-DYNAMIC_OBSTACLE_MAX_HEADING_ERROR_DEG = 45.0
-DYNAMIC_OBSTACLE_REVERSE_HEADING_TOLERANCE_DEG = 30.0
-DYNAMIC_OBSTACLE_MAX_LANE_CHANGE_COUNT = 2
 
 
-INTERSECTION_TYPE_BY_LINK_IDX = {
+# current_link_data 관련 링크 속성
+LINK_INFORMATION_BY_LINK_IDX = {  # 링크별 주행 구간·시설 정보
     'A2256W000219': 'three_light_traffic_signal',
     'A2256W000213': 'three_light_traffic_signal',
     'A2256W000202': 'four_light_traffic_signal',
     'A2256W000728': 'four_light_traffic_signal',
-    'A2256W000315': 'four_light_traffic_signal',
-    'A2256W000310': 'four_light_traffic_signal',
     'A2256W000308': 'four_light_traffic_signal',
     'A2256W000309': 'four_light_traffic_signal',
     'A2256W000128': 'ROUNDABOUT_AHEAD',
@@ -81,80 +107,51 @@ INTERSECTION_TYPE_BY_LINK_IDX = {
     'A2256W000148': 'guardrail_endpoint'
 }
 
-DEFAULT_INTERSECTION_TYPE_PREVIEW_DISTANCE_M_BY_LINK_IDX = {
-    'A2256W000213': 25.0,
-    'A2256W000308': 20.0,
-    'A2256W000315': 20.0
+NOT_AVOID_LINK_IDXS = {  # 장애물 회피를 비활성화할 링크
+    'A2256W000751',
+    'A2256W000748',
+    'A2256W000329',
+    'A2256W000219',
+    'A2256W000213',
+    'A2256W000148',
+    'A2256W000866',
+    'A2256W000846',
+    'A2256W000308'
 }
-
-VIRTUAL_LEFT_CENTER_LINE_LINK_IDX_GROUPS = (
-    (
-        'A2256W000304',
-        'A2256W000148'
-    ),
-    (
-        'A2256W000213',
-    )
+NOT_AVOID_PREVIEW_DISTANCE_M_BY_LINK_IDX = {  # 링크 끝 전 not_avoid 선행 적용 거리 [m]
+    'A2256W000304': 10.0,
+    'A2256W000182': 5.0
+}
+LINK_TYPE_END_OVERRIDE_BY_LINK_IDX = {  # 링크 끝 구간의 link_type과 적용 거리 [m]
+    'A2256W000182': ('6', 5.0)
+}
+LINK_TYPE_SECTION_OVERRIDES = (  # 정적 구간 설정
+    {
+        'link_type': '17',
+        'link_idxs': ('A2256W000213','A2256W000222','A2256W000220','A2256W000202'),
+        'start_remaining_distance_m': 15.0,  # 첫 링크 끝점까지 남은 거리 [m]
+        'end_progress_m': 22.0,  # 마지막 링크 시작점부터 진행 거리 [m]
+    },
 )
 
-CURRENT_LINK_ROUTE_LINK_IDXS = [
-    'A2256W000748',
-    'A2256W000182',
-    'A2256W000329',
-    'A2256W000236',
-    'A2256W000219',
-    'A2256W000215',
-    'A2256W000213',
-    'A2256W000222',
-    'A2256W000220',
-    'A2256W000202',
-    'A2256W000728',
-    'A2256W000599',
-    'A2256W000207',
-    'A2256W000205',
-    'A2256W000315',
-    'A2256W000318',
-    'A2256W000308',
-    'A2256W000083',
-    'A2256W000304',
-    'A2256W000148',
-    'A2256W000146',
-    'A2256W000151',
-    'A2256W000866',
-    'A2256W000054',
-    'A2256W000846',
-    'A2256W000411',
-    'A2256W000420',
-    'A2256W000408',
-    'A2256W000445',
-    'A2256W000153',
-    'A2256W000451',
-    'A2256W000446',
-    'A2256W000448',
-    'A2256W000126',
-    'A2256W000128',
-    'A2256W000333',
-    'A2256W000154',
-    'A2256W000332',
-    'A2256W000751',
-    'A2256W000748'
-]
+DEFAULT_LINK_INFORMATION_PREVIEW_DISTANCE_M_BY_LINK_IDX = {  # 신호등 미리  [m]
+    'A2256W000213': 25.0,
+    'A2256W000308': 25.0,
+    'A2256W000202' : 10.0
+}
+
 
 
 class MoraiMapPublisher:
     def __init__(self):
         self.link_path = self.default_map_path('link_set.json')
         self.node_path = self.default_map_path('node_set.json')
-        self.origin_utm_x = 302595.0
-        self.origin_utm_y = 4124145.0
-        self.use_utm_offset = True  #True면 rviz 띄울 때 origin 좌표를 빼고 띄움
+        self.origin_utm_x = 302595.0  # MORAI 원점 UTM X [m]
+        self.origin_utm_y = 4124145.0  # MORAI 원점 UTM Y [m]
+        self.use_utm_offset = True  # RViz 좌표에 MORAI 원점 오프셋 적용
 
         # 구독 토픽
         self.current_pose_topic = '/current_pose'
-        self.dynamic_obstacle_input_topic = (
-            '/yolo_lidar_fusion/dynamic_objects'
-        )
-
         # 발행 토픽
         self.map_data_topic = '/morai_map_data'
         self.current_link_topic = '/current_link_data'
@@ -164,128 +161,19 @@ class MoraiMapPublisher:
             '/lane_change_candidate_link'
         )
         self.virtual_lane_boundary_topic = '/current_link_virtual_lane_boundaries'
-        self.dynamic_obstacle_link_data_topic = (
-            '/dynamic_obstacle_link_data'
-        )
+        self.heading_filter_deg = 90.0  # 링크 검색 허용 방향 오차 [deg]
 
-        self.heading_filter_deg = 90.0  # 현재 링크 검색 시 허용할 차량-링크 방향 오차 [deg]
 
-        self.reverse_target_distance_m = self.positive_float_param(
-            '~reverse_target_distance_m',
-            DEFAULT_REVERSE_TARGET_DISTANCE_M
-        )
-        self.reverse_target_publish_hz = self.positive_float_param(
-            '~reverse_target_publish_hz',
-            DEFAULT_REVERSE_TARGET_PUBLISH_HZ
-        )
-        self.intersection_preview_distance_m = self.positive_float_param(
-            '~intersection_preview_distance_m',
-            DEFAULT_INTERSECTION_PREVIEW_DISTANCE_M
-        )
-        self.current_link_change_confirm_count = self.bounded_int_param(
-            '~current_link_change_confirm_count',
-            DEFAULT_CURRENT_LINK_CHANGE_CONFIRM_COUNT,
-            1,
-            1000
-        )
-        self.intersection_type_preview_distance_m_by_link_idx = {
-            link_idx: self.positive_float_param(
-                '~intersection_type_preview_distance_m/%s' % link_idx,
-                default_distance_m
-            )
-            for link_idx, default_distance_m in (
-                DEFAULT_INTERSECTION_TYPE_PREVIEW_DISTANCE_M_BY_LINK_IDX.items()
-            )
-        }
-        self.dynamic_obstacle_max_distance_m = self.positive_float_param(
-            '~dynamic_obstacle_max_distance_m',
-            DYNAMIC_OBSTACLE_MAX_DISTANCE_M
-        )
-        self.dynamic_obstacle_max_heading_error_deg = (
-            self.bounded_float_param(
-                '~dynamic_obstacle_max_heading_error_deg',
-                DYNAMIC_OBSTACLE_MAX_HEADING_ERROR_DEG,
-                0.0,
-                180.0
-            )
-        )
-        self.dynamic_obstacle_reverse_heading_tolerance_deg = (
-            self.bounded_float_param(
-                '~dynamic_obstacle_reverse_heading_tolerance_deg',
-                DYNAMIC_OBSTACLE_REVERSE_HEADING_TOLERANCE_DEG,
-                0.0,
-                180.0
-            )
-        )
-        self.dynamic_obstacle_max_lane_change_count = (
-            self.bounded_int_param(
-                '~dynamic_obstacle_max_lane_change_count',
-                DYNAMIC_OBSTACLE_MAX_LANE_CHANGE_COUNT,
-                0,
-                DYNAMIC_OBSTACLE_MAX_LANE_CHANGE_COUNT
-            )
-        )
-        self.map_data_pub = rospy.Publisher(
-            self.map_data_topic,
-            String,
-            queue_size=1,
-            latch=True
-        )
-        self.current_link_pub = rospy.Publisher(
-            self.current_link_topic,
-            CurrentLink,
-            queue_size=10
-        )
-        self.reverse_target_pub = rospy.Publisher(
-            self.reverse_target_topic,
-            Point,
-            queue_size=10
-        )
-        self.lane_change_candidate_data_pub = rospy.Publisher(
-            self.lane_change_candidate_data_topic,
-            PointCloud2,
-            queue_size=1,
-            latch=True
-        )
-        self.lane_change_candidate_link_data_pub = rospy.Publisher(
-            self.lane_change_candidate_link_data_topic,
-            PointCloud2,
-            queue_size=1,
-            latch=True
-        )
-        self.virtual_lane_boundary_pub = rospy.Publisher(
-            self.virtual_lane_boundary_topic,
-            PointCloud2,
-            queue_size=1,
-            latch=True
-        )
-        self.dynamic_obstacle_link_data_pub = rospy.Publisher(
-            self.dynamic_obstacle_link_data_topic,
-            DynamicObstacleLinkArray,
-            queue_size=1
-        )
+        
+        self.map_data_pub = rospy.Publisher(self.map_data_topic, String, queue_size=1, latch=True)
+        self.current_link_pub = rospy.Publisher(self.current_link_topic, CurrentLink, queue_size=10)
+        self.reverse_target_pub = rospy.Publisher(self.reverse_target_topic, Point, queue_size=10)
+        self.tunnel_reverse_target_pub = rospy.Publisher('/tunnel_reverse_link_points', PointCloud2, queue_size=1)
+        self.tunnel_reverse_targets_active = False
+        self.lane_change_candidate_data_pub = rospy.Publisher(self.lane_change_candidate_data_topic, PointCloud2, queue_size=1, latch=True)
+        self.lane_change_candidate_link_data_pub = rospy.Publisher(self.lane_change_candidate_link_data_topic, PointCloud2, queue_size=1, latch=True)
+        self.virtual_lane_boundary_pub = rospy.Publisher(self.virtual_lane_boundary_topic, PointCloud2, queue_size=1, latch=True)
 
-        """
-        버스 전용 도로
-
-        link_idx: "A2256W000362"
-        max_speed: 50.0
-        on_stop_line: True
-        traffic_light_id: "C1256W000054"
-        related_signal: ''
-
-        link_idx: "A2256W000368"
-        max_speed: 50.0
-        on_stop_line: False
-        traffic_light_id: ''
-        related_signal: "straight"
-
-        link_idx: "A2256W000367"
-        max_speed: 45.0
-        on_stop_line: True
-        traffic_light_id: "C1256W000066"
-        related_signal: ''
-        """
 
         self.planner = None
         self.current_link_idx = None
@@ -299,7 +187,10 @@ class MoraiMapPublisher:
         self.lane_change_candidate_link_current_link_idx = None
         self.lane_change_extension_link_idxs = []
         self.lane_change_candidate_generator = None
-        self.dynamic_obstacle_link_projector = None
+        self.link_type_section_ranges_by_link_idx = {}
+        self.lane_change_candidate_lock = threading.RLock()
+        self.latest_lane_change_candidate_context = None
+        self.lane_change_candidate_data_active = False
         self.lane_change_candidate_cache_by_topic = {
             'data': {
                 'link_idx': None,
@@ -316,13 +207,17 @@ class MoraiMapPublisher:
         self.last_lane_change_candidate_link_signature = None
         self.virtual_lane_boundary_generator = (
             VirtualLaneBoundaryGenerator(
-                target_link_idx_groups=VIRTUAL_LEFT_CENTER_LINE_LINK_IDX_GROUPS,
-                lane_width_m=VIRTUAL_CENTER_LINE_LANE_WIDTH_M
+                target_link_idx_groups=VIRTUAL_LANE_BOUNDARY_LINK_IDX_GROUPS,
+                right_boundary_link_idxs=VIRTUAL_RIGHT_BOUNDARY_LINK_IDXS,
+                lane_width_m=VIRTUAL_CENTER_LINE_LANE_WIDTH_M,
+                connected_point_tolerance_m=(
+                    VIRTUAL_CONNECTED_POINT_TOLERANCE_M
+                )
             )
         )
         self.active_virtual_center_line_link_idxs = ()
         self.current_pose_sub = None
-        self.dynamic_obstacle_sub = None
+        self.lane_change_candidate_timer = None
 
         self.load_morai_map()
         self.current_pose_sub = rospy.Subscriber(
@@ -331,47 +226,39 @@ class MoraiMapPublisher:
             self.current_pose_callback,
             queue_size=1
         )
-        self.dynamic_obstacle_sub = rospy.Subscriber(
-            self.dynamic_obstacle_input_topic,
-            FusedObjectArray,
-            self.dynamic_obstacles_callback,
-            queue_size=1
-        )
         self.reverse_target_timer = rospy.Timer(
-            rospy.Duration(1.0 / self.reverse_target_publish_hz),
+            rospy.Duration(1.0 / DEFAULT_REVERSE_TARGET_PUBLISH_HZ),
             self.publish_reverse_target
+        )
+        self.lane_change_candidate_timer = rospy.Timer(
+            rospy.Duration(1.0 / DEFAULT_LANE_CHANGE_CANDIDATE_PUBLISH_HZ),
+            self.publish_lane_change_candidate_data
         )
         rospy.loginfo(
             'Reverse-link target enabled: distance=%.2fm, rate=%.1fHz, '
             'topic=%s',
-            self.reverse_target_distance_m,
-            self.reverse_target_publish_hz,
+            DEFAULT_REVERSE_TARGET_DISTANCE_M,
+            DEFAULT_REVERSE_TARGET_PUBLISH_HZ,
             self.reverse_target_topic
         )
         rospy.loginfo(
-            'Intersection-type preview distances: %s',
+            'Lane-change candidates enabled: rate=%.1fHz, topic=%s',
+            DEFAULT_LANE_CHANGE_CANDIDATE_PUBLISH_HZ,
+            self.lane_change_candidate_data_topic
+        )
+        rospy.loginfo(
+            'Link-information preview distances: %s',
             ', '.join(
                 '%s=%.2fm' % (link_idx, distance_m)
                 for link_idx, distance_m in (
-                    self.intersection_type_preview_distance_m_by_link_idx.items()
+                    DEFAULT_LINK_INFORMATION_PREVIEW_DISTANCE_M_BY_LINK_IDX.items()
                 )
             )
         )
         rospy.loginfo(
             'Current-link change confirmation count: %d',
-            self.current_link_change_confirm_count
+            CURRENT_LINK_CHANGE_CONFIRM_COUNT
         )
-        rospy.loginfo(
-            'Dynamic obstacle link projector enabled: '
-            'input=%s output=%s range=%.1fm heading=%.1fdeg '
-            'lane_changes=%d',
-            self.dynamic_obstacle_input_topic,
-            self.dynamic_obstacle_link_data_topic,
-            self.dynamic_obstacle_max_distance_m,
-            self.dynamic_obstacle_max_heading_error_deg,
-            self.dynamic_obstacle_max_lane_change_count
-        )
-
     def default_map_path(self, file_name):
         package_src = Path(__file__).resolve().parents[2]
         return str(package_src / 'path' / 'MGeo' / file_name)
@@ -392,39 +279,62 @@ class MoraiMapPublisher:
         self.reverse_link_finder = ReverseLinkTargetFinder(
             link_by_idx=self.planner.link_by_idx,
             links_by_to_node=self.planner.links_by_to_node,
-            route_link_idxs=CURRENT_LINK_ROUTE_LINK_IDXS
+            route_link_idxs=CURRENT_LINK_ROUTE_LINK_IDXS,
+            max_previous_link_hops=REVERSE_SEARCH_MAX_PREVIOUS_LINKS,
+            point_epsilon_m=REVERSE_POINT_EQUALITY_EPSILON_M,
+            previous_link_override_by_link_idx=(
+                REVERSE_PREVIOUS_LINK_OVERRIDE_BY_LINK_IDX
+            )
         )
         self.build_lane_change_candidate_link_point_cache()
         self.build_current_link_allowed_link_idxs()
         self.planner.build_nearest_lookup(
             self.current_link_allowed_link_idxs
         )
+        highway_start = CURRENT_LINK_ROUTE_LINK_IDXS.index('A2256W000411')
+        tollgate_end = CURRENT_LINK_ROUTE_LINK_IDXS.index('A2256W000153')
+        highway_route_link_idxs = CURRENT_LINK_ROUTE_LINK_IDXS[
+            highway_start:tollgate_end + 1
+        ]
+        self.lane_change_candidate_allowed_link_idxs = (
+            self.planner.get_lane_change_link_closure(
+                highway_route_link_idxs,
+                max_lane_change_count=CURRENT_LINK_MAX_LANE_CHANGE_COUNT
+            )
+        )
+        self.lane_change_candidate_allowed_link_idx_set = set(
+            self.lane_change_candidate_allowed_link_idxs
+        )
         self.lane_change_candidate_generator = LaneChangeCandidateGenerator(
             links=self.planner.links,
             nodes=self.planner.nodes,
             start_ahead_of_vehicle_m=LANE_CHANGE_CANDIDATE_START_AHEAD_M,
+            candidate_path_length_m=LANE_CHANGE_CANDIDATE_PATH_LENGTH_M,
+            minimum_candidate_path_length_m=(
+                LANE_CHANGE_CANDIDATE_MIN_PATH_LENGTH_M
+            ),
+            length_tolerance_m=(
+                LANE_CHANGE_CANDIDATE_LENGTH_TOLERANCE_M
+            ),
+            point_interval_m=LANE_CHANGE_CANDIDATE_POINT_INTERVAL_M,
+            candidate_path_extension_m=(
+                HIGHWAY_CANDIDATE_PATH_EXTENSION_M
+            ),
+            endpoint_no_next_link_idxs=(
+                LANE_CHANGE_ENDPOINT_NO_NEXT_LINK_IDXS
+            ),
+            path_length_overrides_m=(
+                LANE_CHANGE_PATH_LENGTH_OVERRIDES_M
+            ),
             route_link_idxs=CURRENT_LINK_ROUTE_LINK_IDXS,
             lane_change_extension_link_idxs=(
                 self.lane_change_extension_link_idxs
+            ),
+            candidate_allowed_link_idxs=(
+                self.lane_change_candidate_allowed_link_idxs
             )
         )
-        self.dynamic_obstacle_link_projector = DynamicObstacleLinkProjector(
-            planner=self.planner,
-            route_link_idxs=CURRENT_LINK_ROUTE_LINK_IDXS,
-            allowed_link_idxs=self.current_link_allowed_link_idxs,
-            max_lane_change_count=(
-                self.dynamic_obstacle_max_lane_change_count
-            ),
-            max_obstacle_distance_m=(
-                self.dynamic_obstacle_max_distance_m
-            ),
-            max_heading_error_deg=(
-                self.dynamic_obstacle_max_heading_error_deg
-            ),
-            reverse_heading_tolerance_deg=(
-                self.dynamic_obstacle_reverse_heading_tolerance_deg
-            )
-        )
+        self.build_link_type_section_ranges()
         self.publish_map_data()
         rospy.loginfo('Loaded MORAI map links: %d', len(self.planner.links))
         rospy.loginfo('Loaded MORAI map nodes: %d', len(self.planner.nodes))
@@ -432,6 +342,86 @@ class MoraiMapPublisher:
             'Built nearest lookup segments: %d',
             len(self.planner.segment_refs)
         )
+
+    def build_link_type_section_ranges(self):
+        """연속 구간의 거리 경계를 차선 변경 대상의 중심선에도 적용한다."""
+        self.link_type_section_ranges_by_link_idx = {}
+        generator = self.lane_change_candidate_generator
+
+        for section in LINK_TYPE_SECTION_OVERRIDES:
+            link_idxs = section['link_idxs']
+
+            for link_i, link_idx in enumerate(link_idxs):
+                link = self.planner.link_by_idx.get(str(link_idx))
+
+                if link is None:
+                    rospy.logwarn('Link-type section link not found: %s', link_idx)
+                    continue
+
+                geometry = generator.make_link_geometry(link)
+
+                if geometry is None:
+                    continue
+
+                total_length = geometry['total_length']
+                start_progress = 0.0
+                end_progress = total_length
+
+                if link_i == 0:
+                    start_progress = max(
+                        0.0,
+                        total_length - section['start_remaining_distance_m']
+                    )
+
+                if link_i == len(link_idxs) - 1:
+                    end_progress = min(total_length, section['end_progress_m'])
+
+                target_link_idxs = self.planner.get_lane_change_link_closure(
+                    [link_idx],
+                    max_lane_change_count=CURRENT_LINK_MAX_LANE_CHANGE_COUNT
+                )
+
+                for target_link_idx in target_link_idxs:
+                    target_link = self.planner.link_by_idx[target_link_idx]
+                    target_geometry = generator.make_link_geometry(target_link)
+
+                    if target_geometry is None:
+                        continue
+
+                    target_start = 0.0
+                    target_end = target_geometry['total_length']
+
+                    if target_link_idx == str(link_idx):
+                        target_start = start_progress
+                        target_end = end_progress
+                    else:
+                        # 부분 구간의 경계점을 투영해 차선별 길이 차이를 반영한다.
+                        if start_progress > 0.0:
+                            point = generator.get_link_point_at_progress(
+                                geometry, start_progress
+                            )['point']
+                            target_start = generator.find_nearest_geometry_progress(
+                                target_geometry, point['rviz_x'], point['rviz_y']
+                            )
+
+                        if end_progress < total_length:
+                            point = generator.get_link_point_at_progress(
+                                geometry, end_progress
+                            )['point']
+                            target_end = generator.find_nearest_geometry_progress(
+                                target_geometry, point['rviz_x'], point['rviz_y']
+                            )
+
+                    if (
+                        target_start is None
+                        or target_end is None
+                        or target_start > target_end
+                    ):
+                        continue
+
+                    self.link_type_section_ranges_by_link_idx.setdefault(
+                        target_link_idx, []
+                    ).append((str(section['link_type']), target_start, target_end))
 
     def build_lane_change_candidate_link_point_cache(self):
         self.lane_change_candidate_link_points_by_idx = {}
@@ -540,7 +530,7 @@ class MoraiMapPublisher:
 
     def virtual_lane_boundary_fields(self):
         names = ('x', 'y')
-        return [
+        fields = [
             PointField(
                 name=name,
                 offset=field_i * 8,
@@ -549,6 +539,13 @@ class MoraiMapPublisher:
             )
             for field_i, name in enumerate(names)
         ]
+        fields.append(PointField(
+            name='boundary_id',
+            offset=16,
+            datatype=PointField.UINT8,
+            count=1
+        ))
+        return fields
 
     def lane_change_candidate_fields(self):
         return [
@@ -608,8 +605,15 @@ class MoraiMapPublisher:
 
     def publish_lane_change_candidate_cloud(self, result):
         rows = []
+        # 가능 여부 계산에는 전체 후보를 사용하고, 송신할 좌우 경로만 제한한다.
+        publish_lane_changes = (
+            str(result.get('current_link_idx'))
+            in self.lane_change_candidate_allowed_link_idx_set
+        )
 
         for candidate in result.get('candidates', []):
+            if candidate.get('side') in ('left', 'right') and not publish_lane_changes:
+                continue
             candidate_id = LANE_CHANGE_CANDIDATE_ID_BY_SIDE.get(
                 candidate.get('side')
             )
@@ -727,7 +731,7 @@ class MoraiMapPublisher:
         is_target_link = result['active']
 
         cloud_rows = [
-            (point['utm_x'], point['utm_y'])
+            (point['utm_x'], point['utm_y'], point['boundary_id'])
             for point in result['points']
         ]
 
@@ -741,7 +745,7 @@ class MoraiMapPublisher:
             result['boundary_link_idxs']
         )
         rospy.loginfo(
-            'Published virtual left center line: '
+            'Published virtual lane boundaries: '
             'current_link=%s boundary_links=%s active=%s',
             link_idx,
             ','.join(result['boundary_link_idxs']),
@@ -762,39 +766,11 @@ class MoraiMapPublisher:
             float(pose.point.z)
         )
 
-    def dynamic_obstacles_callback(self, msg):
-        results = self.dynamic_obstacle_link_projector.project_obstacles(
-            obstacles=msg.objects,
-            current_pose=self.current_pose,
-            current_link_idx=self.current_link_idx
-        )
-        output = DynamicObstacleLinkArray()
-        output.header = msg.header
-        output.objects = [
-            self.make_dynamic_obstacle_link_message(result)
-            for result in results
-        ]
-        self.dynamic_obstacle_link_data_pub.publish(output)
-
-    def make_dynamic_obstacle_link_message(self, result):
-        msg = DynamicObstacleLink()
-        msg.track_id = result['track_id']
-        msg.nearest_link_idx = result['nearest_link_idx']
-
-        projected_position = result['projected_position_utm']
-        msg.projected_position_utm.x = projected_position['x']
-        msg.projected_position_utm.y = projected_position['y']
-        msg.projected_position_utm.z = projected_position['z']
-        msg.ego_distance_m = result['ego_distance_m']
-        msg.signed_link_distance_m = result['signed_link_distance_m']
-        msg.signed_heading_error_rad = result[
-            'signed_heading_error_rad'
-        ]
-        return msg
-
     def publish_reverse_target(self, _event):
         current_pose = self.current_pose
         current_link_idx = self.current_link_idx
+
+        self.publish_tunnel_reverse_targets(current_pose, current_link_idx)
 
         if (
             current_pose is None
@@ -806,14 +782,14 @@ class MoraiMapPublisher:
             vehicle_x=current_pose[0],
             vehicle_y=current_pose[1],
             current_link_idx=current_link_idx,
-            target_distance_m=self.reverse_target_distance_m
+            target_distance_m=DEFAULT_REVERSE_TARGET_DISTANCE_M
         )
 
         if target is None:
             rospy.logwarn_throttle(
                 2.0,
                 'Unable to find %.2fm reverse target from link %s',
-                self.reverse_target_distance_m,
+                DEFAULT_REVERSE_TARGET_DISTANCE_M,
                 current_link_idx
             )
             return
@@ -826,6 +802,44 @@ class MoraiMapPublisher:
         )
         self.reverse_target_pub.publish(point_msg)
 
+    def publish_tunnel_reverse_targets(self, current_pose, current_link_idx):
+        in_tunnel = str(current_link_idx) in TUNNEL_LANE_BY_LINK
+        if not in_tunnel and not self.tunnel_reverse_targets_active:
+            return
+
+        rows = []
+        if in_tunnel and current_pose is not None:
+            for lane_id, link_idx in TUNNEL_LINK_BY_LANE.items():
+                target = self.reverse_link_finder.find_target(
+                    vehicle_x=current_pose[0],
+                    vehicle_y=current_pose[1],
+                    current_link_idx=link_idx,
+                    target_distance_m=DEFAULT_REVERSE_TARGET_DISTANCE_M,
+                )
+                if target is None or not all(math.isfinite(v) for v in target):
+                    rospy.logwarn_throttle(
+                        2.0, 'No tunnel reverse target: lane=%d link=%s',
+                        lane_id, link_idx,
+                    )
+                    continue
+                rows.append((lane_id, target[0], target[1], target[2]))
+
+        # UTM 정밀도를 보존한다. yaw는 높이가 아니라 차량 목표 방향 [rad].
+        fields = [
+            PointField('lane_id', 0, PointField.UINT32, 1),
+            PointField('x', 4, PointField.FLOAT64, 1),
+            PointField('y', 12, PointField.FLOAT64, 1),
+            PointField('yaw', 20, PointField.FLOAT64, 1),
+        ]
+        header = Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = 'map'
+        self.tunnel_reverse_target_pub.publish(
+            point_cloud2.create_cloud(header, fields, rows)
+        )
+        # 터널 진출 시 빈 cloud를 한 번 보내 수신측의 이전 후보를 제거한다.
+        self.tunnel_reverse_targets_active = in_tunnel
+
     def publish_current_link_info(self, utm_x, utm_y, yaw=None):
         nearest = self.find_current_link(utm_x, utm_y, yaw)
         nearest = self.confirm_current_link_candidate(
@@ -836,6 +850,8 @@ class MoraiMapPublisher:
         )
 
         if nearest is None:
+            self.latest_lane_change_candidate_context = None
+            self.publish_lane_change_candidate_links(None)
             self.publish_virtual_lane_boundaries(None)
             return
 
@@ -859,26 +875,27 @@ class MoraiMapPublisher:
             on_stop_line = node.get('on_stop_line')
             traffic_light_id = node.get('traffic_light_id')
 
-        candidate_result = self.publish_lane_change_candidate_data(
-            link_idx,
-            nearest['point']['rviz_x'],
-            nearest['point']['rviz_y'],
-            current_segment_index=nearest['segment_index'],
-            current_segment_ratio=nearest['segment_ratio']
+        self.latest_lane_change_candidate_context = {
+            'link_idx': link_idx,
+            'rviz_x': nearest['point']['rviz_x'],
+            'rviz_y': nearest['point']['rviz_y'],
+            'segment_index': nearest['segment_index'],
+            'segment_ratio': nearest['segment_ratio']
+        }
+        # JSON 값을 planner의 금지/목적 링크 보정까지 적용한 속성으로 발행한다.
+        # 후보 경로의 생성 성공 여부나 발행 구간과는 독립적이다.
+        lane_change_permissions = self.get_lane_change_permissions(
+            link,
+            nearest['segment_index'],
+            nearest['segment_ratio']
         )
-        self.publish_lane_change_candidate_link_for_pose(
-            utm_x,
-            utm_y,
-            yaw
-        )
-        candidates = candidate_result.get('candidates', [])
-        can_change_left = any(
-            candidate.get('side') == 'left'
-            for candidate in candidates
-        )
-        can_change_right = any(
-            candidate.get('side') == 'right'
-            for candidate in candidates
+        can_change_left = lane_change_permissions['left']
+        can_change_right = lane_change_permissions['right']
+
+        self.publish_lane_change_candidate_links(
+            link,
+            nearest,
+            lane_change_permissions
         )
 
         self.publish_virtual_lane_boundaries(link)
@@ -896,7 +913,12 @@ class MoraiMapPublisher:
             link.get('related_signal'),
             can_change_left,
             can_change_right,
-            self.get_published_intersection_type(
+            self.get_published_not_avoid(
+                link,
+                nearest['segment_index'],
+                nearest['segment_ratio']
+            ),
+            self.get_published_link_information(
                 link,
                 nearest['segment_index'],
                 nearest['segment_ratio']
@@ -946,7 +968,7 @@ class MoraiMapPublisher:
 
         if (
             self.pending_current_link_count
-            >= self.current_link_change_confirm_count
+            >= CURRENT_LINK_CHANGE_CONFIRM_COUNT
         ):
             rospy.loginfo(
                 'Current link changed after %d consecutive observations: '
@@ -964,7 +986,7 @@ class MoraiMapPublisher:
             self.current_link_idx,
             candidate_link_idx,
             self.pending_current_link_count,
-            self.current_link_change_confirm_count
+            CURRENT_LINK_CHANGE_CONFIRM_COUNT
         )
 
         current_nearest = self.planner.find_nearest_link_and_segment(
@@ -991,7 +1013,40 @@ class MoraiMapPublisher:
         current_segment_index,
         current_segment_ratio
     ):
-        """다음 교차로 링크 진입 전부터 link_type을 1로 발행한다."""
+        """연속 구간 보정, 링크 끝 보정, 교차로 미리보기 순으로 적용한다."""
+        current_link_idx = current_link.get('idx')
+        current_link_idx = (
+            '' if current_link_idx is None else str(current_link_idx)
+        )
+        section_ranges = self.link_type_section_ranges_by_link_idx.get(
+            current_link_idx, ()
+        )
+
+        if section_ranges:
+            progress = self.lane_change_candidate_generator.get_link_progress_at_segment(
+                current_link, current_segment_index, current_segment_ratio
+            )
+
+            if progress is not None:
+                for link_type, start_progress, end_progress in section_ranges:
+                    if start_progress - 1e-6 <= progress <= end_progress + 1e-6:
+                        return link_type
+
+        end_override = LINK_TYPE_END_OVERRIDE_BY_LINK_IDX.get(
+            current_link_idx
+        )
+
+        if end_override is not None:
+            override_link_type, preview_distance_m = end_override
+
+            if self.is_near_link_end(
+                current_link,
+                current_segment_index,
+                current_segment_ratio,
+                preview_distance_m
+            ):
+                return override_link_type
+
         current_link_type = current_link.get('link_type')
         current_link_type = (
             '' if current_link_type is None else str(current_link_type).strip()
@@ -1014,28 +1069,28 @@ class MoraiMapPublisher:
             current_link,
             current_segment_index,
             current_segment_ratio,
-            self.intersection_preview_distance_m
+            DEFAULT_INTERSECTION_PREVIEW_DISTANCE_M
         ):
             return current_link_type
 
         return '1'
 
-    def get_published_intersection_type(
+    def get_published_link_information(
         self,
         current_link,
         current_segment_index,
         current_segment_ratio
     ):
-        """지정된 신호등 링크는 끝점 부근에서만 intersection_type을 발행한다."""
+        """지정된 신호등 링크는 끝점 부근에서만 link_information을 발행한다."""
         link_idx = current_link.get('idx')
         link_idx = '' if link_idx is None else str(link_idx)
-        intersection_type = INTERSECTION_TYPE_BY_LINK_IDX.get(link_idx, '')
+        link_information = LINK_INFORMATION_BY_LINK_IDX.get(link_idx, '')
         preview_distance_m = (
-            self.intersection_type_preview_distance_m_by_link_idx.get(link_idx)
+            DEFAULT_LINK_INFORMATION_PREVIEW_DISTANCE_M_BY_LINK_IDX.get(link_idx)
         )
 
         if preview_distance_m is None:
-            return intersection_type
+            return link_information
 
         if not self.is_near_link_end(
             current_link,
@@ -1045,7 +1100,118 @@ class MoraiMapPublisher:
         ):
             return ''
 
-        return intersection_type
+        return link_information
+
+    def get_published_not_avoid(
+        self,
+        current_link,
+        current_segment_index,
+        current_segment_ratio
+    ):
+        """전 구간 또는 링크 끝 지정 거리 이내에서 회피 금지를 발행한다."""
+        link_idx = current_link.get('idx')
+        link_idx = '' if link_idx is None else str(link_idx)
+
+        if link_idx in NOT_AVOID_LINK_IDXS:
+            return True
+
+        preview_distance_m = NOT_AVOID_PREVIEW_DISTANCE_M_BY_LINK_IDX.get(
+            link_idx
+        )
+
+        if preview_distance_m is None:
+            return False
+
+        return self.is_near_link_end(
+            current_link,
+            current_segment_index,
+            current_segment_ratio,
+            preview_distance_m
+        )
+
+    def get_lane_change_permissions(
+        self,
+        current_link,
+        current_segment_index,
+        current_segment_ratio
+    ):
+        """링크 속성과 현재 진행거리를 반영한 좌우 차선 변경 가능 여부."""
+        permissions = {
+            side: bool(
+                current_link.get('can_move_%s_lane' % side, False)
+            )
+            for side in ('left', 'right')
+        }
+        current_progress = (
+            self.lane_change_candidate_generator.get_link_progress_at_segment(
+                current_link,
+                current_segment_index,
+                current_segment_ratio
+            )
+        )
+        link_idx = current_link.get('idx')
+        link_idx = '' if link_idx is None else str(link_idx)
+
+        for side in ('left', 'right'):
+            if not self.is_lane_change_allowed_at_progress(
+                link_idx,
+                side,
+                current_progress
+            ):
+                permissions[side] = False
+
+        return permissions
+
+    def is_lane_change_allowed_at_progress(
+        self,
+        link_idx,
+        side,
+        current_progress
+    ):
+        minimum_progress_m = (
+            LANE_CHANGE_MIN_PROGRESS_M_BY_LINK_AND_SIDE.get(
+                (str(link_idx), str(side))
+            )
+        )
+
+        if minimum_progress_m is None:
+            return True
+
+        if current_progress is None:
+            return False
+
+        try:
+            current_progress = float(current_progress)
+        except (TypeError, ValueError):
+            return False
+
+        return (
+            math.isfinite(current_progress)
+            and current_progress >= minimum_progress_m
+        )
+
+    def filter_lane_change_candidates_by_progress(
+        self,
+        result,
+        current_link_idx,
+        current_progress
+    ):
+        filtered_candidates = [
+            candidate
+            for candidate in result.get('candidates', [])
+            if self.is_lane_change_allowed_at_progress(
+                current_link_idx,
+                candidate.get('side'),
+                current_progress
+            )
+        ]
+
+        if len(filtered_candidates) == len(result.get('candidates', [])):
+            return result
+
+        filtered_result = dict(result)
+        filtered_result['candidates'] = filtered_candidates
+        return filtered_result
 
     def is_near_link_end(
         self,
@@ -1096,14 +1262,79 @@ class MoraiMapPublisher:
         return True
 
     def find_current_link(self, utm_x, utm_y, yaw=None):
+        excluded_link_idxs = (
+            self.get_current_link_search_excluded_link_idxs(
+                utm_x,
+                utm_y
+            )
+        )
+        allowed_link_idxs = [
+            link_idx
+            for link_idx in self.current_link_allowed_link_idxs
+            if str(link_idx) not in excluded_link_idxs
+        ]
+        allowed_link_idx_set = set(allowed_link_idxs)
+
         return self.find_link_from_allowed_links(
             utm_x,
             utm_y,
             yaw,
             self.current_link_idx,
-            self.current_link_allowed_link_idxs,
-            self.current_link_allowed_link_idx_set
+            allowed_link_idxs,
+            allowed_link_idx_set
         )
+
+    def get_current_link_search_excluded_link_idxs(self, utm_x, utm_y):
+        """진행거리 제한 구간에서는 해당 방향의 목적 링크를 검색에서 뺀다."""
+        excluded_link_idxs = set()
+
+        for (
+            source_link_idx,
+            side
+        ) in LANE_CHANGE_MIN_PROGRESS_M_BY_LINK_AND_SIDE:
+            source_link = self.planner.link_by_idx.get(source_link_idx)
+
+            if source_link is None:
+                continue
+
+            source_nearest = self.planner.find_nearest_link_and_segment(
+                float(utm_x),
+                float(utm_y),
+                candidate_link_idxs=[source_link_idx]
+            )
+
+            if (
+                source_nearest is None
+                or source_nearest['distance'] > (
+                    CURRENT_LINK_REACQUIRE_DISTANCE_M
+                )
+            ):
+                continue
+
+            source_progress = (
+                self.lane_change_candidate_generator
+                .get_link_progress_at_segment(
+                    source_link,
+                    source_nearest['segment_index'],
+                    source_nearest['segment_ratio']
+                )
+            )
+
+            if self.is_lane_change_allowed_at_progress(
+                source_link_idx,
+                side,
+                source_progress
+            ):
+                continue
+
+            destination_link_idx = source_link.get(
+                '%s_lane_change_dst_link_idx' % side
+            )
+
+            if destination_link_idx is not None:
+                excluded_link_idxs.add(str(destination_link_idx))
+
+        return excluded_link_idxs
 
     def find_lane_change_candidate_link_current_link(
         self,
@@ -1252,66 +1483,86 @@ class MoraiMapPublisher:
 
         return candidate_link_idxs
 
-    def publish_lane_change_candidate_data(
-        self,
-        current_link_idx,
-        current_rviz_x,
-        current_rviz_y,
-        current_segment_index=None,
-        current_segment_ratio=None
-    ):
-        result, is_updated = self.make_lane_change_candidate_result(
-            'data',
-            current_link_idx,
-            current_rviz_x,
-            current_rviz_y,
-            current_segment_index,
-            current_segment_ratio
-        )
+    def publish_lane_change_candidate_data(self, _event):
+        context = self.latest_lane_change_candidate_context
+        is_active = context is not None
 
-        if is_updated:
+        if not is_active:
+            if self.lane_change_candidate_data_active:
+                self.publish_lane_change_candidate_cloud({
+                    'current_link_idx': None,
+                    'next_link_idx': None,
+                    'candidates': []
+                })
+                self.lane_change_candidate_data_active = False
+            return
+
+        with self.lane_change_candidate_lock:
+            result, _ = self.make_lane_change_candidate_result(
+                'data',
+                context['link_idx'],
+                context['rviz_x'],
+                context['rviz_y'],
+                context['segment_index'],
+                context['segment_ratio'],
+                force_update=True
+            )
             self.publish_lane_change_candidate_cloud(result)
 
-        return result
+        self.lane_change_candidate_data_active = True
 
-    def publish_lane_change_candidate_link_for_pose(
+    def publish_lane_change_candidate_links(
         self,
-        utm_x,
-        utm_y,
-        yaw=None
+        link,
+        nearest=None,
+        lane_change_permissions=None
     ):
-        nearest = self.find_lane_change_candidate_link_current_link(
-            utm_x,
-            utm_y,
-            yaw
-        )
+        """current_link_data와 같은 보정된 링크에서 변경 가능한 옆 링크를 발행한다."""
+        result = {
+            'current_link_idx': None if link is None else link.get('idx'),
+            'candidates': []
+        }
+        if link is not None:
+            for side in ('left', 'right'):
+                if (
+                    lane_change_permissions is not None
+                    and not lane_change_permissions.get(side, False)
+                ):
+                    continue
+                if not bool(link.get('can_move_%s_lane' % side, False)):
+                    continue
+                dst_idx = link.get('%s_lane_change_dst_link_idx' % side)
+                if dst_idx is None or str(dst_idx) == str(link.get('idx')):
+                    continue
+                dst_idx = str(dst_idx)
+                if len(self.lane_change_candidate_link_points_by_idx.get(dst_idx, ())) < 2:
+                    continue
+                destination_link_idxs = [dst_idx]
+                generator = self.lane_change_candidate_generator
+                # 후보 경로를 만들지 않고 기존 목적 링크 연장 규칙만 재사용한다.
+                # 현재 투영점에서 전방 길이가 부족하면 연결된 다음 링크를 포함한다.
+                point = link['points'][0] if nearest is None else nearest['point']
+                with self.lane_change_candidate_lock:
+                    geometry_result = generator.make_destination_geometry(
+                        link,
+                        self.planner.link_by_idx[dst_idx],
+                        side,
+                        {'point': point},
+                        generator.candidate_path_length_m
+                    )
+                if geometry_result is not None:
+                    destination_link_idxs = [
+                        str(dst_link['idx'])
+                        for dst_link in geometry_result[3]
+                    ]
+                result['candidates'].append({
+                    'side': side,
+                    'destination_link_idx': dst_idx,
+                    'destination_link_idxs': destination_link_idxs
+                })
 
-        if nearest is None:
-            self.lane_change_candidate_link_current_link_idx = None
-            result, is_updated = self.make_lane_change_candidate_result(
-                'link',
-                None,
-                0.0,
-                0.0
-            )
-        else:
-            link = nearest['link']
-            link_idx = link.get('idx')
-            self.lane_change_candidate_link_current_link_idx = (
-                None if link_idx is None else str(link_idx)
-            )
-            result, is_updated = self.make_lane_change_candidate_result(
-                'link',
-                link_idx,
-                nearest['point']['rviz_x'],
-                nearest['point']['rviz_y'],
-                nearest['segment_index'],
-                nearest['segment_ratio']
-            )
-
-        if is_updated:
-            self.publish_lane_change_candidate_link_cloud(result)
-
+        # 동일 링크 구성은 latch로 유지하고, 변경 불가/링크 손실 시 빈 cloud로 지운다.
+        self.publish_lane_change_candidate_link_cloud(result)
         return result
 
     def make_lane_change_candidate_result(
@@ -1321,7 +1572,8 @@ class MoraiMapPublisher:
         current_rviz_x,
         current_rviz_y,
         current_segment_index=None,
-        current_segment_ratio=None
+        current_segment_ratio=None,
+        force_update=False
     ):
         link_idx = '' if current_link_idx is None else str(current_link_idx)
 
@@ -1374,25 +1626,34 @@ class MoraiMapPublisher:
 
         cache = self.lane_change_candidate_cache_by_topic[topic_key]
 
-        if cache_matches(cache):
+        if not force_update and cache_matches(cache):
             return cache['result'], False
 
-        for other_topic_key, other_cache in (
-            self.lane_change_candidate_cache_by_topic.items()
-        ):
-            if other_topic_key == topic_key or not cache_matches(other_cache):
-                continue
+        if not force_update:
+            for other_topic_key, other_cache in (
+                self.lane_change_candidate_cache_by_topic.items()
+            ):
+                if (
+                    other_topic_key == topic_key
+                    or not cache_matches(other_cache)
+                ):
+                    continue
 
-            cache['link_idx'] = other_cache['link_idx']
-            cache['progress_m'] = other_cache['progress_m']
-            cache['result'] = other_cache['result']
-            return cache['result'], True
+                cache['link_idx'] = other_cache['link_idx']
+                cache['progress_m'] = other_cache['progress_m']
+                cache['result'] = other_cache['result']
+                return cache['result'], True
 
         result = self.lane_change_candidate_generator.make_candidates(
             link_idx,
             float(current_rviz_x),
             float(current_rviz_y),
             current_progress=current_progress
+        )
+        result = self.filter_lane_change_candidates_by_progress(
+            result,
+            link_idx,
+            current_progress
         )
         cache['link_idx'] = link_idx
         cache['progress_m'] = current_progress
@@ -1409,10 +1670,12 @@ class MoraiMapPublisher:
         related_signal,
         can_change_left,
         can_change_right,
-        intersection_type
+        not_avoid,
+        link_information
     ):
         msg = CurrentLink()
         msg.link_idx = '' if link_idx is None else str(link_idx)
+        msg.not_avoid = bool(not_avoid)
         msg.link_type = '' if link_type is None else str(link_type)
         msg.max_speed = self.to_float_or_default(max_speed, 0.0)
         msg.on_stop_line = bool(on_stop_line)
@@ -1420,8 +1683,8 @@ class MoraiMapPublisher:
         msg.related_signal = '' if related_signal is None else str(related_signal)
         msg.can_change_left = bool(can_change_left)
         msg.can_change_right = bool(can_change_right)
-        msg.intersection_type = (
-            '' if intersection_type is None else str(intersection_type)
+        msg.link_information = (
+            '' if link_information is None else str(link_information)
         )
         self.current_link_pub.publish(msg)
 
@@ -1433,81 +1696,6 @@ class MoraiMapPublisher:
             return float(value)
         except (TypeError, ValueError):
             return float(default)
-
-    def positive_float_param(self, name, default):
-        value = rospy.get_param(name, default)
-
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            rospy.logwarn(
-                'Invalid %s=%r; using %.3f',
-                name,
-                value,
-                default
-            )
-            return float(default)
-
-        if not math.isfinite(value) or value <= 0.0:
-            rospy.logwarn(
-                'Invalid %s=%r; using %.3f',
-                name,
-                value,
-                default
-            )
-            return float(default)
-
-        return value
-
-    def bounded_float_param(self, name, default, minimum, maximum):
-        value = rospy.get_param(name, default)
-
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            rospy.logwarn(
-                'Invalid %s=%r; using %.3f',
-                name,
-                value,
-                default
-            )
-            return float(default)
-
-        if not math.isfinite(value) or not minimum <= value <= maximum:
-            rospy.logwarn(
-                'Invalid %s=%r; using %.3f',
-                name,
-                value,
-                default
-            )
-            return float(default)
-
-        return value
-
-    def bounded_int_param(self, name, default, minimum, maximum):
-        value = rospy.get_param(name, default)
-
-        try:
-            value = int(value)
-        except (TypeError, ValueError):
-            rospy.logwarn(
-                'Invalid %s=%r; using %d',
-                name,
-                value,
-                default
-            )
-            return int(default)
-
-        if not minimum <= value <= maximum:
-            rospy.logwarn(
-                'Invalid %s=%r; using %d',
-                name,
-                value,
-                default
-            )
-            return int(default)
-
-        return value
 
     def make_link_payload(self, link):
         return {

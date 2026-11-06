@@ -8,30 +8,84 @@ import os
 import numpy as np
 
 
-LEFT_LANE_CHANGE_DISABLED_LINK_IDXS = {
+# 현재 링크 경로·탐색 설정
+CURRENT_LINK_REACQUIRE_DISTANCE_M = 4.0  # 이 거리 이상 벗어나면 전체 경로에서 재탐색 [m]
+CURRENT_LINK_MAX_LANE_CHANGE_COUNT = 3  # 경로 탐색에 허용할 최대 좌우 차선 이동 횟수
+CURRENT_LINK_CHANGE_CONFIRM_COUNT = 10  # 링크 전환에 필요한 연속 관측 횟수
+CURRENT_LINK_ROUTE_LINK_IDXS = [  # 기준 주행 경로 링크 순서
+    'A2256W000748',
+    'A2256W000182',
+    'A2256W000329',
+    'A2256W000236',
+    'A2256W000219',
+    'A2256W000215',
+    'A2256W000213',
+    'A2256W000222',
+    'A2256W000220',
+    'A2256W000202',
+    'A2256W000728',
+    'A2256W000599',
+    'A2256W000207',
+    'A2256W000205',
+    'A2256W000315',
+    'A2256W000318',
+    'A2256W000308',
+    'A2256W000083',
+    'A2256W000304',
+    'A2256W000148',
+    'A2256W000146',
+    'A2256W000151',
+    'A2256W000866',
+    'A2256W000054',
+    'A2256W000846',
+    'A2256W000411',
+    'A2256W000420',
+    'A2256W000408',
+    'A2256W000445',
+    'A2256W000153',
+    'A2256W000451',
+    'A2256W000446',
+    'A2256W000448',
+    'A2256W000126',
+    'A2256W000128',
+    'A2256W000333',
+    'A2256W000154',
+    'A2256W000332',
+    'A2256W000751',
+    'A2256W000748'
+]
+
+# MGeo 속성 보정 설정
+REVERSED_LINK_IDXS = {  # 진행 방향을 반전할 링크
+    'A2256W000131'
+}
+LEFT_LANE_CHANGE_DISABLED_LINK_IDXS = {  # MGeo보다 왼쪽 이동을 우선 금지할 링크
     'A2256W000418',
     'A2256W000431',
     'A2256W000435',
     'A2256W000423'
 }
-RIGHT_LANE_CHANGE_DISABLED_LINK_IDXS = {
+RIGHT_LANE_CHANGE_DISABLED_LINK_IDXS = {  # MGeo보다 오른쪽 이동을 우선 금지할 링크
     'A2256W000409',
     'A2256W000423',
     'A2256W000422',
     "A2256W000408"
 }
-LEFT_LANE_CHANGE_DST_OVERRIDES = {
+LEFT_LANE_CHANGE_DST_OVERRIDES = {  
     'A2256W000319': 'A2256W000318',
-    'A2256W000849': 'A2256W000054'
+    'A2256W000849': 'A2256W000054',
+    'A2256W000126': 'A2256W000131'
 }
-RIGHT_LANE_CHANGE_DST_OVERRIDES = {
+RIGHT_LANE_CHANGE_DST_OVERRIDES = { 
     'A2256W000318': 'A2256W000319',
     'A2256W000054': 'A2256W000849'
 }
-LINK_TYPE_OVERRIDES = {
-    'A2256W000054': '4'
+LINK_TYPE_OVERRIDES = {  # MGeo link_type 보정값
+    'A2256W000054': '4',
+    'A2256W000318': '6',
+    'A2256W000319': '6'
 }
-RELATED_SIGNAL_OVERRIDES = {
+RELATED_SIGNAL_OVERRIDES = {  # MGeo 연관 신호 정보 보정값
     'A2256W000182': 'left_unprotected'
 }
 
@@ -183,6 +237,10 @@ class MoraiMapPlanner:
                 continue
 
             link_idx = link.get('idx')
+            from_node_idx = link.get('from_node_idx')
+            to_node_idx = link.get('to_node_idx')
+            lane_mark_left = list(link.get('lane_mark_left') or [])
+            lane_mark_right = list(link.get('lane_mark_right') or [])
             can_move_left_lane = bool(
                 link.get('can_move_left_lane', False)
             )
@@ -203,6 +261,18 @@ class MoraiMapPlanner:
                 link.get('width_end'),
                 width_start
             )
+
+            if str(link_idx) in REVERSED_LINK_IDXS:
+                points.reverse()
+                from_node_idx, to_node_idx = to_node_idx, from_node_idx
+                width_start, width_end = width_end, width_start
+                lane_mark_left, lane_mark_right = lane_mark_right, lane_mark_left
+                can_move_left_lane, can_move_right_lane = (
+                    can_move_right_lane, can_move_left_lane
+                )
+                left_lane_change_dst_link_idx, right_lane_change_dst_link_idx = (
+                    right_lane_change_dst_link_idx, left_lane_change_dst_link_idx
+                )
 
             if str(link_idx) in LEFT_LANE_CHANGE_DISABLED_LINK_IDXS:
                 can_move_left_lane = False
@@ -226,15 +296,15 @@ class MoraiMapPlanner:
 
             self.links.append({
                 'idx': link_idx,
-                'from_node_idx': link.get('from_node_idx'),
-                'to_node_idx': link.get('to_node_idx'),
+                'from_node_idx': from_node_idx,
+                'to_node_idx': to_node_idx,
                 'points': points,
                 'max_speed': link.get('max_speed'),
                 'link_length': link.get('link_length'),
                 'width_start': width_start,
                 'width_end': width_end,
-                'lane_mark_left': list(link.get('lane_mark_left') or []),
-                'lane_mark_right': list(link.get('lane_mark_right') or []),
+                'lane_mark_left': lane_mark_left,
+                'lane_mark_right': lane_mark_right,
                 'can_move_left_lane': can_move_left_lane,
                 'can_move_right_lane': can_move_right_lane,
                 'left_lane_change_dst_link_idx': left_lane_change_dst_link_idx,

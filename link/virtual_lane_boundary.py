@@ -6,16 +6,14 @@ import math
 import numpy as np
 
 
-DEFAULT_LANE_WIDTH_M = 3.5
-CONNECTED_POINT_TOLERANCE_M = 1e-3
-
-
 class VirtualLaneBoundaryGenerator:
     def __init__(
         self,
+        lane_width_m,
+        connected_point_tolerance_m,
         target_link_idxs=None,
-        lane_width_m=DEFAULT_LANE_WIDTH_M,
-        target_link_idx_groups=None
+        target_link_idx_groups=None,
+        right_boundary_link_idxs=None
     ):
         if target_link_idx_groups is None:
             target_link_idx_groups = (target_link_idxs or [],)
@@ -38,19 +36,23 @@ class VirtualLaneBoundaryGenerator:
             for group in self.target_link_idx_groups
             for link_idx in group
         }
-        self.lane_width_m = self.read_positive_float(
-            lane_width_m,
-            DEFAULT_LANE_WIDTH_M
+        self.right_boundary_link_idxs = {
+            str(link_idx)
+            for link_idx in (right_boundary_link_idxs or [])
+        }
+        self.lane_width_m = self.read_positive_float(lane_width_m)
+        self.connected_point_tolerance_m = self.read_positive_float(
+            connected_point_tolerance_m
         )
 
-    def read_positive_float(self, value, default):
+    def read_positive_float(self, value):
         try:
             value = float(value)
         except (TypeError, ValueError):
-            return float(default)
+            raise ValueError('Expected a positive finite float')
 
         if not math.isfinite(value) or value <= 0.0:
-            return float(default)
+            raise ValueError('Expected a positive finite float')
 
         return value
 
@@ -63,11 +65,11 @@ class VirtualLaneBoundaryGenerator:
 
         if is_target_link:
             if link_by_idx is None:
-                points = self.make_left_boundary(link)
+                points = self.make_link_boundary(link)
                 boundary_link_idxs = [link_idx] if points else []
             else:
                 points, boundary_link_idxs = (
-                    self.make_connected_left_boundary(
+                    self.make_connected_boundary(
                         link_by_idx,
                         target_link_idx_group
                     )
@@ -83,8 +85,8 @@ class VirtualLaneBoundaryGenerator:
     def get_target_link_idx_group(self, link_idx):
         return self.target_link_idx_group_by_link_idx.get(str(link_idx), ())
 
-    def make_connected_left_boundary(self, link_by_idx, target_link_idxs):
-        """대상 링크들의 좌측 경계를 설정된 순서대로 하나의 선으로 잇는다."""
+    def make_connected_boundary(self, link_by_idx, target_link_idxs):
+        """대상 링크들의 가상 경계점을 설정된 순서대로 모은다."""
         connected_points = []
         boundary_link_idxs = []
 
@@ -94,13 +96,14 @@ class VirtualLaneBoundaryGenerator:
             if target_link is None:
                 continue
 
-            boundary_points = self.make_left_boundary(target_link)
+            boundary_points = self.make_link_boundary(target_link)
 
             if not boundary_points:
                 continue
 
             if (
                 connected_points
+                and connected_points[-1]['boundary_id'] == boundary_points[0]['boundary_id']
                 and self.points_are_connected(
                     connected_points[-1],
                     boundary_points[0]
@@ -116,11 +119,11 @@ class VirtualLaneBoundaryGenerator:
     def points_are_connected(self, first, second):
         dx = float(first['utm_x']) - float(second['utm_x'])
         dy = float(first['utm_y']) - float(second['utm_y'])
-        tolerance_sq = CONNECTED_POINT_TOLERANCE_M ** 2
+        tolerance_sq = self.connected_point_tolerance_m ** 2
         return dx * dx + dy * dy <= tolerance_sq
 
-    def make_left_boundary(self, link):
-        """링크 중심선에서 차로 폭의 절반만큼 왼쪽으로 이동한 선을 만든다."""
+    def make_link_boundary(self, link):
+        """링크 진행 방향 기준으로 차로 폭의 절반만큼 경계를 이동한다."""
         points = link.get('points', [])
 
         if len(points) < 2:
@@ -174,17 +177,22 @@ class VirtualLaneBoundaryGenerator:
         left_normals = np.column_stack((-tangents[:, 1], tangents[:, 0]))
 
         offset_distance_m = 0.5 * self.lane_width_m
+        boundary_id = 0  # 왼쪽 경계
+        if str(link.get('idx', '')) in self.right_boundary_link_idxs:
+            offset_distance_m *= -1.0
+            boundary_id = 1  # 오른쪽 경계
         offsets = left_normals * offset_distance_m
-        left_rviz_xy = rviz_xy + offsets
-        left_utm_xy = utm_xy + offsets
+        boundary_rviz_xy = rviz_xy + offsets
+        boundary_utm_xy = utm_xy + offsets
 
         return [
             {
-                'rviz_x': float(left_rviz_xy[point_i, 0]),
-                'rviz_y': float(left_rviz_xy[point_i, 1]),
-                'utm_x': float(left_utm_xy[point_i, 0]),
-                'utm_y': float(left_utm_xy[point_i, 1]),
-                'z': float(points[point_i].get('morai_z', 0.0))
+                'rviz_x': float(boundary_rviz_xy[point_i, 0]),
+                'rviz_y': float(boundary_rviz_xy[point_i, 1]),
+                'utm_x': float(boundary_utm_xy[point_i, 0]),
+                'utm_y': float(boundary_utm_xy[point_i, 1]),
+                'z': float(points[point_i].get('morai_z', 0.0)),
+                'boundary_id': boundary_id
             }
             for point_i in range(len(points))
         ]

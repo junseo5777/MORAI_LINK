@@ -6,4 +6,5 @@ string traffic_light_id
 string related_signal
 bool can_change_left
 bool can_change_right
-string intersection_type
+string link_information
+bool not_avoid

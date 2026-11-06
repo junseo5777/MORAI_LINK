@@ -5278,5 +5278,16 @@
     ],
     "on_stop_line": false,
     "traffic_light_id": null
+  },
+  {
+    "idx": "A1256W001000",
+    "node_type": "7",
+    "point": [
+      -58.408218700203214,
+      -105.57737666909885,
+      28.363638963491564
+    ],
+    "on_stop_line": false,
+    "traffic_light_id": null
   }
 ]

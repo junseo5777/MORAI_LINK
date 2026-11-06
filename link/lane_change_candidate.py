@@ -1,27 +1,23 @@
-# -*- coding: utf-8 -*-
-
 import math
 from bisect import bisect_left
-
-START_AHEAD_OF_VEHICLE_M = 0.0 # 몇 m 앞에서 차선변경 후보를 만들지
-CANDIDATE_PATH_LENGTH_M = 40.0 # 후보의 길이
-MIN_CANDIDATE_PATH_LENGTH_M = CANDIDATE_PATH_LENGTH_M * 0.4 # 축소 가능한 최소 후보 길이
-CANDIDATE_LENGTH_TOLERANCE_M = 0.15 # 후보 길이 허용 오차
-CANDIDATE_POINT_INTERVAL_M = 0.5 # 베지어 곡선 생성 시 목표 표본 간격
 
 
 class LaneChangeCandidateGenerator:
     def __init__(
         self,
-        links=None,
-        nodes=None,
-        start_ahead_of_vehicle_m=START_AHEAD_OF_VEHICLE_M,
-        candidate_path_length_m=CANDIDATE_PATH_LENGTH_M,
-        length_tolerance_m=CANDIDATE_LENGTH_TOLERANCE_M,
-        point_interval_m=CANDIDATE_POINT_INTERVAL_M,
-        minimum_candidate_path_length_m=MIN_CANDIDATE_PATH_LENGTH_M,
+        links,
+        nodes,
+        start_ahead_of_vehicle_m,
+        candidate_path_length_m,
+        length_tolerance_m,
+        point_interval_m,
+        minimum_candidate_path_length_m,
+        candidate_path_extension_m,
+        endpoint_no_next_link_idxs,
+        path_length_overrides_m,
         route_link_idxs=None,
-        lane_change_extension_link_idxs=None
+        lane_change_extension_link_idxs=None,
+        candidate_allowed_link_idxs=None
     ):
         self.start_ahead_of_vehicle_m = max(
             0.0,
@@ -34,6 +30,17 @@ class LaneChangeCandidateGenerator:
         )
         self.length_tolerance_m = max(0.0, float(length_tolerance_m))
         self.point_interval_m = max(1e-3, float(point_interval_m))
+        self.candidate_path_extension_m = max(
+            0.0,
+            float(candidate_path_extension_m)
+        )
+        self.endpoint_no_next_link_idx_set = {
+            str(link_idx) for link_idx in endpoint_no_next_link_idxs
+        }
+        self.path_length_overrides_m = {
+            str(link_idx): max(0.0, float(path_length_m))
+            for link_idx, path_length_m in path_length_overrides_m.items()
+        }
         self.route_link_idxs = [
             str(link_idx)
             for link_idx in (route_link_idxs or [])
@@ -49,6 +56,9 @@ class LaneChangeCandidateGenerator:
         self.lane_change_extension_link_idx_set = {
             str(link_idx)
             for link_idx in (lane_change_extension_link_idxs or [])
+        }
+        self.candidate_allowed_link_idx_set = {
+            str(link_idx) for link_idx in (candidate_allowed_link_idxs or [])
         }
         self.link_by_idx = {}
         self.links_by_from_node = {}
@@ -130,14 +140,33 @@ class LaneChangeCandidateGenerator:
             return result
 
         start_link = start_info['link']
+        is_highway_candidate = (
+            current_link_idx in self.candidate_allowed_link_idx_set
+        )
+        center_path_length = self.candidate_path_length_m
+
+        if is_highway_candidate:
+            center_path_length += self.candidate_path_extension_m
 
         center_candidate = self.make_keep_lane_candidate(
             start_link,
-            start_info
+            start_info,
+            center_path_length
         )
 
         if center_candidate is not None:
             result['candidates'].append(center_candidate)
+
+        # 중앙 후보는 전 구간에서 만들고, 좌우 후보 계산은 고속도로로 제한한다.
+        if not is_highway_candidate:
+            return result
+
+        # 전방 시작점 설정으로 다음 링크에서 시작하는 후보도 예외 구간에서는 제외한다.
+        if (
+            current_link_idx in self.endpoint_no_next_link_idx_set
+            and str(start_link.get('idx')) != current_link_idx
+        ):
+            return result
 
         for side in ('left', 'right'):
             candidate = self.make_lane_change_candidate(
@@ -158,11 +187,19 @@ class LaneChangeCandidateGenerator:
             'candidates': []
         }
 
-    def make_keep_lane_candidate(self, start_link, start_info):
+    def make_keep_lane_candidate(
+        self,
+        start_link,
+        start_info,
+        target_length=None
+    ):
+        if target_length is None:
+            target_length = self.candidate_path_length_m
+
         forward_path = self.collect_forward_path(
             start_link,
             start_info['progress'],
-            self.candidate_path_length_m
+            target_length
         )
 
         if forward_path is None:
@@ -451,12 +488,16 @@ class LaneChangeCandidateGenerator:
 
         dst_link_idx = str(dst_link.get('idx'))
 
+        target_length = self.path_length_overrides_m.get(
+            str(start_link.get('idx')),
+            self.candidate_path_length_m
+        )
         destination_result = self.make_destination_geometry(
             start_link,
             dst_link,
             side,
             start_info,
-            self.candidate_path_length_m
+            target_length + self.candidate_path_extension_m
         )
 
         if destination_result is None:
@@ -469,11 +510,11 @@ class LaneChangeCandidateGenerator:
             destination_links
         ) = destination_result
 
-        path = self.find_lane_change_curve_by_length(
+        path = self.find_lane_change_straight_path_by_length(
             start_info,
             destination_geometry,
             nearest_dst_s,
-            self.candidate_path_length_m,
+            target_length,
             self.minimum_candidate_path_length_m
         )
 
@@ -483,9 +524,38 @@ class LaneChangeCandidateGenerator:
         if not path:
             return None
 
-        endpoint_link_idx = self.find_nearest_link_idx_to_point(
+        lane_change_endpoint_link_idx = self.find_nearest_link_idx_to_point(
             destination_links,
             path[-1]
+        )
+
+        # 이 두 출발 링크에서는 현재 구간의 직접 인접 차로에서 끝나야 한다.
+        # 다음 구간에 끝나는 후보를 짧게 잘라 대체하지 않고 그대로 제외한다.
+        if (
+            str(start_link.get('idx')) in self.endpoint_no_next_link_idx_set
+            and str(lane_change_endpoint_link_idx) != dst_link_idx
+        ):
+            return None
+
+        extension_links = destination_links
+
+        if str(start_link.get('idx')) in self.endpoint_no_next_link_idx_set:
+            # 기존 예외 구간은 연장선도 직접 인접 링크를 벗어나지 않는다.
+            extension_links = [dst_link]
+
+        extension_geometry = self.make_link_chain_geometry(extension_links)
+        path = self.extend_path_along_geometry(
+            path,
+            extension_geometry,
+            self.candidate_path_extension_m
+        )
+        endpoint_link_idx = self.find_nearest_link_idx_to_point(
+            extension_links,
+            path[-1]
+        )
+        used_destination_links = self.links_through_endpoint(
+            extension_links,
+            endpoint_link_idx
         )
 
         return {
@@ -493,7 +563,7 @@ class LaneChangeCandidateGenerator:
             'destination_link_idx': dst_link_idx,
             'destination_link_idxs': [
                 str(link.get('idx'))
-                for link in destination_links
+                for link in used_destination_links
                 if link.get('idx') is not None
             ],
             'endpoint_link_idx': (
@@ -504,6 +574,65 @@ class LaneChangeCandidateGenerator:
             'path_length_m': self.calc_curve_length(path),
             'path': path
         }
+
+    def extend_path_along_geometry(self, path, geometry, extension_length):
+        """후보 끝에서 목적 차선 중심선을 따라 지정 거리만큼 연장한다."""
+        if not path or geometry is None or extension_length <= 0.0:
+            return path
+
+        endpoint = path[-1]
+        start_progress = self.find_nearest_geometry_progress(
+            geometry,
+            float(endpoint.get('rviz_x', 0.0)),
+            float(endpoint.get('rviz_y', 0.0))
+        )
+
+        if start_progress is None:
+            return path
+
+        end_progress = min(
+            geometry['total_length'],
+            start_progress + float(extension_length)
+        )
+        available_length = max(0.0, end_progress - start_progress)
+
+        if available_length <= 1e-6:
+            return path
+
+        interval_count = max(
+            1,
+            int(math.ceil(available_length / self.point_interval_m))
+        )
+        extension_points = []
+
+        for interval_i in range(interval_count + 1):
+            progress = start_progress + (
+                available_length * interval_i / interval_count
+            )
+            point_info = self.get_link_point_at_progress(geometry, progress)
+
+            if point_info is not None:
+                extension_points.append(point_info['point'])
+
+        return self.remove_consecutive_duplicate_points(
+            list(path) + extension_points
+        )
+
+    def links_through_endpoint(self, links, endpoint_link_idx):
+        """후보 종점이 포함된 링크까지만 목적 링크 목록에 남긴다."""
+        if endpoint_link_idx is None:
+            return list(links)
+
+        endpoint_link_idx = str(endpoint_link_idx)
+        used_links = []
+
+        for link in links:
+            used_links.append(link)
+
+            if str(link.get('idx')) == endpoint_link_idx:
+                break
+
+        return used_links
 
     def find_lane_change_destination(self, source_link, side):
         if side == 'left':
@@ -575,7 +704,7 @@ class LaneChangeCandidateGenerator:
                 source_geometry,
                 list(destination_links)
             )
-            high_length = self.calc_candidate_bezier_length(
+            high_length = self.calc_candidate_straight_length(
                 start_info,
                 self.get_link_point_at_progress(
                     geometry,
@@ -832,103 +961,54 @@ class LaneChangeCandidateGenerator:
 
         return best_s
 
-    def find_lane_change_curve_by_length(
-        self,
-        start_info,
-        dst_geometry,
-        dst_start_s,
-        target_length,
+    def find_lane_change_straight_path_by_length(
+        self, start_info, dst_geometry, dst_start_s, target_length,
         minimum_length=None
     ):
+        """목적지 중심선과 목표 반경 원의 첫 전방 교점을 직선으로 연결한다."""
+        if dst_geometry is None or target_length <= 0.0:
+            return None
         geometry = dst_geometry
-
-        if geometry is None or target_length <= 0.0:
-            return None
-
-        low_s = max(0.0, min(float(dst_start_s), geometry['total_length']))
-        high_s = geometry['total_length']
-        low_end_info = self.get_link_point_at_progress(
-            geometry,
-            low_s
-        )
-        high_end_info = self.get_link_point_at_progress(
-            geometry,
-            high_s
-        )
-        low_length = self.calc_candidate_bezier_length(
-            start_info,
-            low_end_info
-        )
-        high_length = self.calc_candidate_bezier_length(
-            start_info,
-            high_end_info
-        )
-
-        if low_length is None or high_length is None:
-            return None
-
-        if low_length > target_length + self.length_tolerance_m:
-            return None
-
-        if high_length < target_length - self.length_tolerance_m:
-            if minimum_length is None:
-                return None
-
-            if high_length < minimum_length - self.length_tolerance_m:
-                return None
-
-            return self.make_candidate_bezier_curve(
-                start_info,
-                high_end_info
-            )
-
-        best_end_info, best_length = min(
-            (
-                (low_end_info, low_length),
-                (high_end_info, high_length)
-            ),
-            key=lambda item: abs(item[1] - target_length)
-        )
-
-        for _ in range(12):
-            mid_s = 0.5 * (low_s + high_s)
-            end_info = self.get_link_point_at_progress(
-                geometry,
-                mid_s
-            )
-            curve_length = self.calc_candidate_bezier_length(
-                start_info,
-                end_info
-            )
-
-            if curve_length is None:
-                return None
-
-            if abs(curve_length - target_length) < abs(
-                best_length - target_length
-            ):
-                best_end_info = end_info
-                best_length = curve_length
-
-            if abs(curve_length - target_length) <= self.length_tolerance_m:
-                return self.make_candidate_bezier_curve(
-                    start_info,
-                    end_info
-                )
-
-            if curve_length < target_length:
-                low_s = mid_s
-            else:
-                high_s = mid_s
-
-        if abs(best_length - target_length) <= (
-            self.length_tolerance_m
+        start_s = max(0.0, min(float(dst_start_s), geometry['total_length']))
+        start = start_info['point']
+        first = self.get_link_point_at_progress(geometry, start_s)
+        if self.calc_candidate_straight_length(start_info, first) > (
+            target_length + self.length_tolerance_m
         ):
-            return self.make_candidate_bezier_curve(
-                start_info,
-                best_end_info
-            )
-
+            return None
+        # 선분과 원의 교점을 해석적으로 계산해 반복 곡선 길이 탐색을 없앤다.
+        for i, seg_length in enumerate(geometry['segment_lengths']):
+            end_s = geometry['cumulative_lengths'][i + 1]
+            if seg_length <= 1e-9 or end_s <= start_s:
+                continue
+            begin_s = max(start_s, geometry['cumulative_lengths'][i])
+            a = self.get_link_point_at_progress(geometry, begin_s)['point']
+            b = self.get_link_point_at_progress(geometry, end_s)['point']
+            dx, dy = b['rviz_x'] - a['rviz_x'], b['rviz_y'] - a['rviz_y']
+            ox, oy = a['rviz_x'] - start['rviz_x'], a['rviz_y'] - start['rviz_y']
+            aa = dx * dx + dy * dy
+            if aa <= 1e-12:
+                continue
+            bb = 2.0 * (ox * dx + oy * dy)
+            cc = ox * ox + oy * oy - target_length * target_length
+            discriminant = bb * bb - 4.0 * aa * cc
+            if discriminant < -1e-9:
+                continue
+            root = math.sqrt(max(0.0, discriminant))
+            for ratio in sorted(((-bb - root) / (2.0 * aa),
+                                 (-bb + root) / (2.0 * aa))):
+                if -1e-9 <= ratio <= 1.0 + 1e-9:
+                    ratio = max(0.0, min(1.0, ratio))
+                    end_info = self.get_link_point_at_progress(
+                        geometry, begin_s + ratio * (end_s - begin_s)
+                    )
+                    return self.make_candidate_straight_path(start_info, end_info)
+        end_info = self.get_link_point_at_progress(geometry, geometry['total_length'])
+        length = self.calc_candidate_straight_length(start_info, end_info)
+        if (minimum_length is not None
+                and minimum_length - self.length_tolerance_m <= length
+                <= target_length + self.length_tolerance_m):
+            return self.make_candidate_straight_path(start_info, end_info)
         return None
 
     def make_link_geometry(self, link):
@@ -1038,110 +1118,24 @@ class LaneChangeCandidateGenerator:
 
         return float(point.get(key, 0.0))
 
-    def calc_candidate_bezier_length(self, start_info, end_info):
-        """베지어 점 목록을 만들지 않고 기존 표본 방식으로 길이만 계산한다."""
+    def calc_candidate_straight_length(self, start_info, end_info):
         if start_info is None or end_info is None:
             return None
+        start, end = start_info['point'], end_info['point']
+        return math.hypot(end['rviz_x'] - start['rviz_x'],
+                          end['rviz_y'] - start['rviz_y'])
 
-        p0 = start_info['point']
-        p3 = end_info['point']
-        heading0 = start_info['heading']
-        heading1 = end_info['heading']
-        chord_length = math.hypot(
-            p3['rviz_x'] - p0['rviz_x'],
-            p3['rviz_y'] - p0['rviz_y']
-        )
-
-        if chord_length <= 1e-9:
+    def make_candidate_straight_path(self, start_info, end_info):
+        length = self.calc_candidate_straight_length(start_info, end_info)
+        if length is None or length <= 1e-9:
             return None
-
-        control_length = min(max(chord_length * 0.5, 2.0), 15.0)
-        p1_x = p0['rviz_x'] + math.cos(heading0) * control_length
-        p1_y = p0['rviz_y'] + math.sin(heading0) * control_length
-        p2_x = p3['rviz_x'] - math.cos(heading1) * control_length
-        p2_y = p3['rviz_y'] - math.sin(heading1) * control_length
-        sample_count = max(
-            2,
-            int(math.ceil(chord_length / self.point_interval_m)) + 1
-        )
-        curve_length = 0
-        previous_x = None
-        previous_y = None
-
-        for step in range(sample_count):
-            t = step / float(sample_count - 1)
-            one_minus_t = 1.0 - t
-            b0 = one_minus_t ** 3
-            b1 = 3.0 * one_minus_t * one_minus_t * t
-            b2 = 3.0 * one_minus_t * t * t
-            b3 = t ** 3
-            current_x = (
-                b0 * p0['rviz_x'] + b1 * p1_x
-                + b2 * p2_x + b3 * p3['rviz_x']
-            )
-            current_y = (
-                b0 * p0['rviz_y'] + b1 * p1_y
-                + b2 * p2_y + b3 * p3['rviz_y']
-            )
-
-            if previous_x is not None:
-                curve_length += math.hypot(
-                    current_x - previous_x,
-                    current_y - previous_y
-                )
-
-            previous_x = current_x
-            previous_y = current_y
-
-        return curve_length
-
-    def make_candidate_bezier_curve(self, start_info, end_info):
-        if start_info is None or end_info is None:
-            return None
-
-        p0 = start_info['point']
-        p3 = end_info['point']
-        heading0 = start_info['heading']
-        heading1 = end_info['heading']
-        chord_length = math.hypot(
-            p3['rviz_x'] - p0['rviz_x'],
-            p3['rviz_y'] - p0['rviz_y']
-        )
-
-        if chord_length <= 1e-9:
-            return None
-
-        control_length = min(max(chord_length * 0.5, 2.0), 15.0)
-        p1_x = p0['rviz_x'] + math.cos(heading0) * control_length
-        p1_y = p0['rviz_y'] + math.sin(heading0) * control_length
-        p2_x = p3['rviz_x'] - math.cos(heading1) * control_length
-        p2_y = p3['rviz_y'] - math.sin(heading1) * control_length
-        curve = []
-        sample_count = max(
-            2,
-            int(math.ceil(chord_length / self.point_interval_m)) + 1
-        )
-
-        for step in range(sample_count):
-            t = step / float(sample_count - 1)
-            one_minus_t = 1.0 - t
-            b0 = one_minus_t ** 3
-            b1 = 3.0 * one_minus_t * one_minus_t * t
-            b2 = 3.0 * one_minus_t * t * t
-            b3 = t ** 3
-            curve.append({
-                'rviz_x': (
-                    b0 * p0['rviz_x'] + b1 * p1_x
-                    + b2 * p2_x + b3 * p3['rviz_x']
-                ),
-                'rviz_y': (
-                    b0 * p0['rviz_y'] + b1 * p1_y
-                    + b2 * p2_y + b3 * p3['rviz_y']
-                ),
-                'z': p0['z'] + (p3['z'] - p0['z']) * t
-            })
-
-        return curve
+        start, end = start_info['point'], end_info['point']
+        intervals = max(1, int(math.ceil(length / self.point_interval_m)))
+        return [
+            {key: start[key] + (end[key] - start[key]) * i / intervals
+             for key in ('rviz_x', 'rviz_y', 'z')}
+            for i in range(intervals + 1)
+        ]
 
     def calc_curve_length(self, curve):
         return sum(
