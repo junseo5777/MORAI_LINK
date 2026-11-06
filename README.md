@@ -64,14 +64,36 @@ ROS 입출력과 현재 링크 상태를 관리하고, 지도 검색·후보 경
 
 ## 결과 시각화
 
-### 전역 경로와 링크 연결
+### 현재 차로와 좌우 차선 변경 후보
 
-![RViz 전역 경로](docs/images/rviz-global-path-cropped.png)
+![RViz의 차량 위치와 중앙·좌우 후보 경로, MORAI의 다차로 도로 화면](docs/images/morai-rviz-lane-change-candidates.png)
 
-### MORAI 차량 위치와 RViz 경로
+왼쪽 RViz의 차량 위치와 중앙·좌우 후보 경로를 오른쪽 MORAI의 차로 배치와 함께 확인할 수 있습니다. 차량 위치에서 인접 차로로 이어지는 후보 경로가 드러나는 장면입니다.
 
-![MORAI와 RViz 주행 위치 비교](docs/images/morai-rviz-driving-cropped.png)
+<details>
+<summary>RViz 후보 경로 확대 보기</summary>
 
-### 회전교차로의 링크 연결
+<p align="center">
+  <img src="docs/images/rviz-lane-change-candidates.png" width="560" alt="차량 위치에서 중앙과 좌우 차로로 이어지는 RViz 후보 경로 확대 화면">
+</p>
+
+</details>
+
+### 곡선 구간의 차량 위치와 경로
+
+![곡선 구간의 RViz 링크·경로와 MORAI 차량 위치 비교](docs/images/morai-rviz-curved-road.png)
+
+곡선 구간에서 차량 주변의 링크와 경로를 MORAI 화면과 나란히 비교합니다. 직선 구간과 다른 도로 형상에서도 차량 위치와 인접 차로의 관계를 볼 수 있습니다.
+
+### MGeo 도로망과 링크 연결
+
+![RViz에 표시한 MGeo 도로망과 교차로·회전교차로의 링크 연결 구조](docs/images/rviz-link-network.png)
+
+도로망을 넓게 표시해 평행 차로, 교차로, 회전교차로의 링크 연결 구조를 확인합니다.
+
+<details>
+<summary>회전교차로의 MORAI·RViz 비교 보기</summary>
 
 ![회전교차로 link 경로](docs/images/morai-rviz-roundabout-cropped.png)
+
+</details>
